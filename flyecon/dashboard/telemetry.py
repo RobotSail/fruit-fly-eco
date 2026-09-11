@@ -103,6 +103,65 @@ class TelemetryStore:
                 continue
         return events
 
+    def read_from_offset(self, byte_offset: int = 0) -> tuple[list[TelemetryEvent], int]:
+        """Read new events starting from a byte offset.
+
+        Opens the JSONL file, seeks to *byte_offset*, reads all complete
+        lines from that point, and returns the parsed events together with
+        the new byte offset (ready for the next call).
+
+        Partial or corrupt lines are silently skipped — the returned offset
+        always points past the last *successfully parsed* newline, so the
+        next call will re-try any incomplete trailing data.
+
+        Returns
+        -------
+        tuple[list[TelemetryEvent], int]
+            (new_events, new_byte_offset).  Empty list + unchanged offset
+            when the file does not exist or has no new data.
+        """
+        if not self.path.exists():
+            return [], 0
+
+        events: list[TelemetryEvent] = []
+        new_offset = byte_offset
+
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(byte_offset)
+                raw = f.read()
+                new_offset = byte_offset + len(raw)
+        except Exception as exc:
+            log.warning("telemetry_read_offset_error", error=str(exc))
+            return [], byte_offset
+
+        # Walk through complete lines only
+        text = raw.decode("utf-8", errors="replace")
+        # If there's no trailing newline, the last chunk may be partial —
+        # rewind offset to exclude it so the next call retries.
+        if text and not text.endswith("\n"):
+            last_nl = text.rfind("\n")
+            if last_nl == -1:
+                # Entire read is a partial line — return nothing, rewind
+                return [], byte_offset
+            # Exclude the partial tail
+            new_offset = byte_offset + len(text[:last_nl + 1].encode("utf-8"))
+            text = text[:last_nl + 1]
+
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(TelemetryEvent.from_json(line))
+            except (json.JSONDecodeError, KeyError) as exc:
+                log.warning(
+                    "telemetry_offset_parse_error", line=line[:80], error=str(exc),
+                )
+                continue
+
+        return events, new_offset
+
     def count(self) -> int:
         """Count total events in the store."""
         if not self.path.exists():
