@@ -132,6 +132,11 @@ _DASHBOARD_TEMPLATE = Template(
     {{ avatar_html }}
   </div>
 
+  <!-- Oracle Duel Visualization (stub) -->
+  <div id="oracle-duel-stub" style="display:none;text-align:center;padding:10px;">
+    <p style="color:#888;font-style:italic;">Oracle duel: two flies face across a table.</p>
+  </div>
+
   <!-- Panel 1: FCI -->
   <div id="panel-fci" class="panel">
     <h2>Panel 1 — Fly Confidence Index</h2>
@@ -364,10 +369,42 @@ def _extract_dashboard_data(events: list[TelemetryEvent]) -> dict[str, Any]:
     }
 
 
+def _build_avatar_html(
+    fci: float,
+    event: str,
+    ladder_level: int,
+    avatar_mode: str = "ascii",
+) -> str:
+    """Build the avatar HTML using the specified tier.
+
+    Degrade chain: threejs → sprite → ascii.
+    If a higher tier fails to import, falls back to the next.
+    """
+    if avatar_mode == "threejs":
+        try:
+            from flyecon.avatar.threejs import ThreeJSAvatar
+            return ThreeJSAvatar().to_html(fci=fci, event=event)
+        except Exception:
+            avatar_mode = "sprite"  # fall through to sprite
+
+    if avatar_mode == "sprite":
+        try:
+            from flyecon.avatar.sprite import SpriteAvatar
+            return SpriteAvatar().to_html(fci=fci, event=event)
+        except Exception:
+            pass  # fall through to ascii
+
+    # ASCII is the bottom tier — always works
+    return ASCIIAvatar().to_html(
+        fci=fci, event=event, ladder_level=ladder_level,
+    )
+
+
 def render_dashboard(
     telemetry: TelemetryStore,
     output_path: Path,
     n_events: int = 1000,
+    avatar_mode: str = "ascii",
 ) -> Path:
     """Render the 10-panel dashboard as a single self-contained HTML file.
 
@@ -375,6 +412,7 @@ def render_dashboard(
         telemetry: TelemetryStore to read events from.
         output_path: Path to write the HTML file.
         n_events: Number of latest events to read.
+        avatar_mode: Avatar tier — 'ascii', 'sprite', or 'threejs'.
 
     Returns:
         Path to the rendered HTML file.
@@ -382,12 +420,12 @@ def render_dashboard(
     events = telemetry.read_latest(n=n_events)
     data = _extract_dashboard_data(events)
 
-    # Build avatar
-    avatar = ASCIIAvatar()
-    avatar_html = avatar.to_html(
+    # Build avatar with degrade chain
+    avatar_html = _build_avatar_html(
         fci=data["last_fci"],
         event=data["last_event"],
         ladder_level=data["ladder_level"],
+        avatar_mode=avatar_mode,
     )
 
     # FCI status label

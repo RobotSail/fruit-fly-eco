@@ -328,7 +328,12 @@ def _train(
     return 0
 
 
-def _run_harness(iterations: int, control: str | None) -> int:
+def _run_harness(
+    iterations: int,
+    control: str | None,
+    connectome_name: str = "synthetic",
+    avatar_mode: str = "ascii",
+) -> int:
     """Run the full harness (or a control experiment)."""
     if control is not None:
         from flyecon.controls import run_control_experiment
@@ -346,7 +351,21 @@ def _run_harness(iterations: int, control: str | None) -> int:
         print(report.read_text())
         return 0
 
-    from flyecon.harness import Harness
+    from flyecon.harness import (
+        CONNECTOME_FULL,
+        CONNECTOME_MUSHROOM_BODY,
+        CONNECTOME_SYNTHETIC,
+        Harness,
+    )
+
+    # Map CLI connectome name to harness mode
+    mode_map = {
+        "full": CONNECTOME_FULL,
+        "mushroom-body": CONNECTOME_MUSHROOM_BODY,
+        "synthetic": CONNECTOME_SYNTHETIC,
+        "test": CONNECTOME_SYNTHETIC,
+    }
+    connectome_mode = mode_map.get(connectome_name, CONNECTOME_SYNTHETIC)
 
     harness = Harness(
         n_neurons=200,
@@ -356,6 +375,8 @@ def _run_harness(iterations: int, control: str | None) -> int:
         checkpoint_interval=25,
         dashboard_interval=50,
         n_steps=128,
+        connectome_mode=connectome_mode,
+        avatar_mode=avatar_mode,
     )
     harness.boot()
 
@@ -439,6 +460,8 @@ def main() -> int:
         print("  run                   Run full harness (perpetual)")
         print("    --iterations N      Run for N iterations then exit")
         print("    --control TYPE      Run control experiment (rewired/random/no_connectome/all)")
+        print("    --connectome NAME   Connectome: synthetic, mushroom-body, or full")
+        print("    --avatar MODE       Avatar tier: ascii, sprite, or threejs")
         print("  status                Show mission state, heartbeats, ladder")
         print("  oracle solve          Solve MDP, print summary, cache policy")
         print("  oracle eval           Oracle vs random evaluation")
@@ -464,6 +487,8 @@ def main() -> int:
         print("    --telemetry PATH    Telemetry JSONL file (default: mission_telemetry.jsonl)")
         print("    --output PATH       Output HTML path (default: dashboard.html)")
         print("  avatar ascii          Render ASCII fly avatar")
+        print("  avatar sprite         Render 2D sprite fly avatar (HTML)")
+        print("  avatar threejs        Render 3D three.js fly avatar (HTML)")
         print("    --fci VALUE         FCI value 0-1 (default: 0.5)")
         print("    --event NAME        Economy event (round_win, forced_eco, etc.)")
         print("  resilience status     Show heartbeats, ladder level, last checkpoint")
@@ -480,7 +505,17 @@ def main() -> int:
             idx = args.index("--control")
             if idx + 1 < len(args):
                 control = args[idx + 1]
-        return _run_harness(iterations, control)
+        connectome_name = "synthetic"
+        if "--connectome" in args:
+            idx = args.index("--connectome")
+            if idx + 1 < len(args):
+                connectome_name = args[idx + 1]
+        avatar_mode = "ascii"
+        if "--avatar" in args:
+            idx = args.index("--avatar")
+            if idx + 1 < len(args):
+                avatar_mode = args[idx + 1]
+        return _run_harness(iterations, control, connectome_name, avatar_mode)
 
     if args[0] == "status":
         return _show_status()
@@ -625,26 +660,40 @@ def main() -> int:
 
     if args[0] == "avatar":
         if len(args) < 2:
-            print("Usage: python -m flyecon avatar {ascii}")
+            print("Usage: python -m flyecon avatar {ascii|sprite|threejs}")
             return 1
 
+        fci_val = 0.5
+        if "--fci" in args:
+            idx = args.index("--fci")
+            if idx + 1 < len(args):
+                fci_val = float(args[idx + 1])
+
+        event_name = ""
+        if "--event" in args:
+            idx = args.index("--event")
+            if idx + 1 < len(args):
+                event_name = args[idx + 1]
+
         if args[1] == "ascii":
-            fci_val = 0.5
-            if "--fci" in args:
-                idx = args.index("--fci")
-                if idx + 1 < len(args):
-                    fci_val = float(args[idx + 1])
-
-            event_name = ""
-            if "--event" in args:
-                idx = args.index("--event")
-                if idx + 1 < len(args):
-                    event_name = args[idx + 1]
-
             from flyecon.avatar.ascii import ASCIIAvatar
 
             avatar = ASCIIAvatar()
             print(avatar.render(fci=fci_val, event=event_name))
+            return 0
+
+        if args[1] == "sprite":
+            from flyecon.avatar.sprite import SpriteAvatar
+
+            sprite = SpriteAvatar()
+            print(sprite.to_html(fci=fci_val, event=event_name))
+            return 0
+
+        if args[1] == "threejs":
+            from flyecon.avatar.threejs import ThreeJSAvatar
+
+            threejs = ThreeJSAvatar()
+            print(threejs.to_html(fci=fci_val, event=event_name))
             return 0
 
         print(f"Unknown avatar command: {args[1]}")

@@ -437,12 +437,27 @@ def build_fly_policy(
     connectome: Connectome,
     gain: float,
     duration_ms: float = DEFAULT_BIN_MS,
+    output_neuron_ids: list[int] | None = None,
 ) -> FlyPolicy:
     """Build a :class:`FlyPolicy` from a connectome and calibrated gain.
 
     Picks the first ``min(N_INPUT_NEURONS, n)`` neurons as inputs and
-    the last ``min(20, n)`` as outputs.  Baseline rates are clamped
-    to ≥1 Hz to prevent extreme normalisation.
+    the last ``min(20, n)`` as outputs (or *output_neuron_ids* if
+    provided — used for full-connectome DN-class readout expansion).
+    Baseline rates are clamped to ≥1 Hz to prevent extreme normalisation.
+
+    Parameters
+    ----------
+    connectome : Connectome
+        Signed sparse connectome.
+    gain : float
+        Calibrated synaptic gain.
+    duration_ms : float
+        Readout bin duration (ms).
+    output_neuron_ids : list[int] | None
+        Explicit output neuron indices. When ``None``, uses last-N.
+        When provided (e.g. all DN-class neurons for full connectome),
+        those indices are used directly.
     """
     encoder = PopulationEncoder()
     n = connectome.n_neurons
@@ -455,8 +470,11 @@ def build_fly_policy(
     baseline_rates = baseline_counts / (duration_ms / 1000.0)
     baseline_rates = torch.clamp(baseline_rates, min=1.0)
 
-    n_outputs = min(20, n)
-    output_ids = list(range(n - n_outputs, n))
+    if output_neuron_ids is not None and len(output_neuron_ids) > 0:
+        output_ids = output_neuron_ids
+    else:
+        n_outputs = min(20, n)
+        output_ids = list(range(n - n_outputs, n))
 
     readout = SpikeReadout(
         output_neuron_ids=output_ids,
