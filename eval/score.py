@@ -137,8 +137,70 @@ def economy_mdp() -> dict[str, Any]:
 
 
 def oracle_solver() -> dict[str, Any]:
-    """Stub — returns 0.0 until Phase 2."""
-    return _dim_result(0.0, "Not implemented until Phase 2")
+    """Verify Oracle value iteration converges, policy is sane, Oracle beats random."""
+    errors: list[str] = []
+    checks_passed = 0
+    total_checks = 0
+
+    try:
+        from flyecon.oracle.mdp import EconomyMDP, idx_from_money
+        from flyecon.oracle.solver import solve, verify_against_random
+
+        mdp = EconomyMDP()
+        policy = solve(mdp, gamma=0.99, tol=1e-8)
+
+        # Check 1: Convergence in < 100 iterations
+        total_checks += 1
+        if policy.iterations < 100:
+            checks_passed += 1
+        else:
+            errors.append(f"Convergence took {policy.iterations} iterations (expected <100)")
+
+        # Check 2: Policy never chooses FULL_BUY when money < cost
+        total_checks += 1
+        full_buy_idx = mdp.actions().index(BuyPlan.FULL_BUY)
+        full_buy_cost = BUY_PLAN_COSTS["FULL_BUY"]
+        max_poor_idx = idx_from_money(full_buy_cost - 100)
+        violations = 0
+        for s_idx in range(mdp.n_states):
+            s = mdp.idx_to_state(s_idx)
+            if s.money_idx <= max_poor_idx and policy.policy_table[s_idx] == full_buy_idx:
+                violations += 1
+        if violations == 0:
+            checks_passed += 1
+        else:
+            errors.append(f"FULL_BUY chosen in {violations} unaffordable states")
+
+        # Check 3: Pistol round action is not FULL_BUY
+        total_checks += 1
+        ps = pistol_round_state()
+        pistol_action = policy.decide(ps)
+        if pistol_action != BuyPlan.FULL_BUY:
+            checks_passed += 1
+        else:
+            errors.append("Pistol round chose FULL_BUY (expected ECO or FORCE_BUY)")
+
+        # Check 4: Oracle wins more rounds than random (≥1.0 extra wins,
+        # equivalent to ≥$3250 in win-reward value, well above $500)
+        total_checks += 1
+        result = verify_against_random(policy, n_episodes=500, seed=42)
+        if result.wins_advantage >= 1.0:
+            checks_passed += 1
+        else:
+            errors.append(
+                f"Oracle wins advantage: {result.wins_advantage:.2f} "
+                f"(expected ≥1.0 rounds)"
+            )
+
+    except Exception as e:
+        total_checks = 1
+        errors.append(f"Oracle solver failed: {e}")
+
+    score = checks_passed / total_checks if total_checks > 0 else 0.0
+    details = f"{checks_passed}/{total_checks} checks passed"
+    if errors:
+        details += "; ERRORS: " + "; ".join(errors)
+    return _dim_result(score, details)
 
 
 def connectome_etl() -> dict[str, Any]:

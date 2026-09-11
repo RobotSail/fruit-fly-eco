@@ -1,41 +1,66 @@
-# Builder Review — Phase 1: Project scaffold + eval harness
+# Builder Review — Phase 2: Baseline Oracle
 
-## Status: ✅ COMPLETE
+## Summary
+Implemented the Baseline Oracle as a NumPy value-iteration solver over the
+MR12 economy MDP. The Oracle is a standalone, zero-connectome-dependency
+component that solves the full state space (~96,600 states) and produces
+optimal buy-plan decisions.
 
-## Deliverables
+## Changes
 
-### 1. Project directory tree
-- Created full 9-team architecture under `flyecon/`
-- All modules have `__init__.py` stubs: etl, sim, encoding, readout, policy, oracle, avatar, dashboard, resilience, state, eval
-- `flyecon/__init__.py` initializes structlog with JSON output
-- `flyecon/__main__.py` CLI entry point stub
+### flyecon/oracle/mdp.py (new)
+- `EconomyMDP` class with full state space: money (161 buckets) × loss_streak (5) × round (12) × half (2) × opp_loss_streak (5) = 96,600 states
+- Parameterised win-probability model (`DEFAULT_WIN_PROBS`) — tunable, documented
+- `transition()` delegates to `flyecon.state.economy.step()` — Oracle shares exact MR12 rules
+- Affordability masking: unaffordable actions return empty transitions (solver uses -inf Q)
+- Terminal state detection: round 12 half 1 is absorbing (match over)
+- Reward: 1.0 for win, 0.0 for loss (Oracle maximises expected round wins)
 
-### 2. Core implementations
-- **`flyecon/state/constants.py`** — All LIF parameters (V_REST_MV=-52.0, V_THRESH_MV=-45.0, TAU_MS=20.0, DT_MS=5.0), NT sign map (ACh:+1, GABA:-1, Glu:-1, His:-1, dopamine separate), MIN_CONFIDENCE=0.5, economy constants (money range, loss-bonus ladder, kill rewards, MR12 rules)
-- **`flyecon/state/economy.py`** — EconomyState frozen dataclass, BuyPlan enum (5 plans), pistol_round_state() factory, step() MR12 transition function with full mechanics
-- **`flyecon/eval/harness.py`** — evaluate_policy() with ScenarioResult and EvalResult dataclasses
+### flyecon/oracle/solver.py (new)
+- `solve(mdp, gamma=0.99, tol=1e-8)` → `Policy` via NumPy value iteration
+- Per-state gamma: terminal states use γ=0, ensuring fast convergence (25 iterations)
+- Vectorised VI loop: precomputed transition arrays for O(1) per-step
+- `Policy` class with `decide(state)`, `value(state)`, `summary()`
+- `simulate_episode()` stochastic simulation with win-probability model
+- `verify_against_random()` → `VerificationResult` with wins and money metrics
 
-### 3. pyproject.toml
-- Dependencies: torch>=2.0, numpy>=1.24, pyarrow>=14.0, plotly>=5.18, jinja2>=3.1, structlog>=23.0
-- Dev deps: pytest, mypy, ruff
-- Python >=3.12, hatchling build system
+### tests/test_oracle.py (new, 16 tests)
+- State space size = 96,600
+- Index roundtrip consistency
+- Transition probabilities sum to 1 for affordable actions
+- Convergence in <100 iterations (actual: 25)
+- Policy never chooses FULL_BUY when money < $4,750
+- Pistol round ($800) never picks FULL_BUY
+- Rich state ($10,000) never picks SAVE
+- Oracle dominates random by ≥1.0 rounds/match (actual: ~1.7)
 
-### 4. eval/score.py
-- 6 eval dimensions: economy_mdp (active, 12/12 checks), oracle_solver (stub), connectome_etl (stub), simulation_runs (stub), fly_vs_oracle (stub), dashboard_renders (stub)
-- economy_mdp scores 1.0 — all MR12 rules verified
+### eval/score.py (updated oracle_solver stub)
+- 4 checks: convergence, affordability, pistol sanity, Oracle vs random
 
-### 5. Tests
-- `tests/conftest.py` — shared fixtures
-- `tests/test_constants.py` — 19 tests: units consistency, subthreshold range, NT sign map coverage
-- `tests/test_economy.py` — 27 tests: pistol start, loss-bonus ladder progression, win/loss mechanics, halftime reset, buy plan costs, state validation
-- **46/46 tests pass**
+### flyecon/__main__.py (updated CLI)
+- `python -m flyecon oracle solve` — solve MDP, print summary, cache to checkpoints/
+- `python -m flyecon oracle eval --episodes N` — Oracle vs random evaluation
 
-### 6. factory.md
-- Project configuration, guards, constraints, eval dimensions, modifiable/fixed surfaces, architecture diagram
+## Key Design Decisions
 
-## Verification
-- `pytest`: 46/46 passed
-- `ruff check`: clean
-- `eval/score.py`: economy_mdp 1.0, aggregate 0.167 (5 stubs at 0.0)
-- No fixed surface files modified
-- All files within declared scope
+1. **Round-win reward** (not money): Using raw money as reward makes SAVE dominant
+   (not spending = more money). Round-win reward correctly incentivises the
+   Oracle to manage money as a means to winning rounds.
+
+2. **Terminal states**: Round 12 half 1 creates a self-loop in economy.step().
+   Without γ=0 at terminal states, VI took 2,800+ iterations. With per-state
+   gamma, convergence is 25 iterations.
+
+3. **Affordability masking**: Unaffordable actions map to -inf Q values, ensuring
+   the policy never recommends buying equipment the team can't afford.
+
+4. **VerificationResult**: Returns both money and wins metrics. The Oracle
+   wins ~1.7 more rounds/match than random but accumulates less money (it
+   spends on equipment). The wins advantage × WIN_REWARD ≈ $5,500 money-equivalent.
+
+## Metrics
+- All 62 tests pass (46 Phase 1 + 16 Phase 2)
+- eval/score.py: economy_mdp 1.0, oracle_solver 1.0
+- Solve time: ~5 seconds (including precomputation)
+- Convergence: 25 iterations
+- Oracle wins advantage: ~1.7 rounds/match over random
