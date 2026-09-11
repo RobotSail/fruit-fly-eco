@@ -1,1 +1,1 @@
-"""FLY//ECON policy module — stub for Phase 1."""
+"""FLY//ECON policy module — PPO with fixed-reservoir connectome."""

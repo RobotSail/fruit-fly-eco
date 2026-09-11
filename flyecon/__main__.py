@@ -268,6 +268,66 @@ def _encoding_test_discrimination(connectome_name: str, gain: float | None) -> i
     return 0
 
 
+def _train(
+    connectome_name: str,
+    iterations: int,
+    eval_interval: int,
+) -> int:
+    """Run PPO training."""
+    from flyecon.policy.ppo import PPOTrainer, build_fly_policy
+
+    if connectome_name == "test":
+        from flyecon.etl.controls import random_sparse
+
+        conn = random_sparse(n_neurons=50, density=0.1, seed=42)
+        gain = 0.0
+        print("Using 50-neuron random test connectome (gain=0.0)")
+    else:
+        conn = _load_connectome_by_name(connectome_name)
+        from flyecon.sim.calibration import calibrate_gain
+
+        print(f"Calibrating gain for {connectome_name}...")
+        cal = calibrate_gain(conn, target_rate_hz=(1.0, 10.0), duration_ms=1000.0)
+        gain = cal.gain
+        print(f"  Gain: {gain:.8f} (rate: {cal.mean_rate_hz:.2f} Hz)")
+
+    print("Building FlyPolicy...")
+    policy = build_fly_policy(conn, gain=gain)
+
+    # Optionally solve Oracle for periodic evaluation
+    oracle = None
+    if eval_interval > 0:
+        from flyecon.oracle.mdp import EconomyMDP
+        from flyecon.oracle.solver import solve
+
+        print("Solving Oracle MDP...")
+        mdp = EconomyMDP()
+        oracle = solve(mdp, gamma=0.99, tol=1e-8)
+        print(f"  Oracle solved in {oracle.iterations} iterations")
+
+    print(f"\nTraining for {iterations} iterations "
+          f"(eval every {eval_interval})...\n")
+    trainer = PPOTrainer(policy, n_steps=128)
+    tlog = trainer.train(
+        n_iterations=iterations,
+        eval_interval=eval_interval,
+        oracle=oracle,
+    )
+
+    print(f"\n{'='*50}")
+    print(f"Training complete: {iterations} iterations")
+    if tlog.metrics:
+        last = tlog.metrics[-1]
+        for k, v in last.items():
+            print(f"  {k}: {v:.4f}")
+    if tlog.eval_results:
+        last_eval = tlog.eval_results[-1]
+        print("\nLast evaluation:")
+        print(f"  Value ratio: {last_eval.value_ratio:.4f}")
+        print(f"  Agreement:   {last_eval.agreement_rate:.4f}")
+    return 0
+
+
 def main() -> int:
     """Entry point — dispatch CLI commands."""
     args = sys.argv[1:]
@@ -292,6 +352,10 @@ def main() -> int:
         print("                        Encode states, simulate, report discrimination")
         print("    --connectome NAME   Connectome to use (default: mushroom-body)")
         print("    --gain VALUE        Gain value (auto-calibrates if omitted)")
+        print("  train                 Run PPO training")
+        print("    --connectome NAME   Connectome to use (default: mushroom-body, or 'test')")
+        print("    --iterations N      Number of training iterations (default: 100)")
+        print("    --eval-interval N   Evaluate against Oracle every N iterations (default: 50)")
         return 0
 
     if args[0] == "oracle":
@@ -384,6 +448,24 @@ def main() -> int:
 
         print(f"Unknown encoding command: {args[1]}")
         return 1
+
+    if args[0] == "train":
+        connectome_name = "mushroom-body"
+        if "--connectome" in args:
+            idx = args.index("--connectome")
+            if idx + 1 < len(args):
+                connectome_name = args[idx + 1]
+        iterations = 100
+        if "--iterations" in args:
+            idx = args.index("--iterations")
+            if idx + 1 < len(args):
+                iterations = int(args[idx + 1])
+        eval_interval = 50
+        if "--eval-interval" in args:
+            idx = args.index("--eval-interval")
+            if idx + 1 < len(args):
+                eval_interval = int(args[idx + 1])
+        return _train(connectome_name, iterations, eval_interval)
 
     print(f"Unknown command: {args[0]}")
     return 1
