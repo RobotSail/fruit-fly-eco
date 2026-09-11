@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/osilkin/fruit-fly/.factory-worktrees/run-be7a5cbc/.factory/hooks/verify-design.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
