@@ -1,1 +1,1 @@
-"""FLY//ECON avatar module — stub for Phase 1."""
+"""FLY//ECON avatar module — ASCII/2D/3D fly rendering."""

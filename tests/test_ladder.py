@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
 from flyecon.resilience.ladder import (
-    CPU_MIN_COUNT,
     DISK_CRITICAL_MB,
     DISK_LOW_MB,
     MAX_LEVEL,
@@ -13,7 +10,6 @@ from flyecon.resilience.ladder import (
     RAM_LOW_MB,
     DegradationLadder,
     ResourceReport,
-    TrainingConfig,
     probe_resources,
 )
 

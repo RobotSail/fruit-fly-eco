@@ -1,1 +1,1 @@
-"""FLY//ECON dashboard module — stub for Phase 1."""
+"""FLY//ECON dashboard module — 10-panel HTML generator with telemetry + FCI."""

@@ -137,7 +137,11 @@ def save_checkpoint(
         # Metadata → JSON
         meta_path = tmp_dir / "metadata.json"
         # Make sure metadata is JSON-serializable
-        safe_meta = {k: v for k, v in bundle.metadata.items() if isinstance(v, (str, int, float, bool, type(None)))}
+        json_types = (str, int, float, bool, type(None))
+        safe_meta = {
+            k: v for k, v in bundle.metadata.items()
+            if isinstance(v, json_types)
+        }
         meta_path.write_text(json.dumps(safe_meta, indent=2))
 
         # fsync all files
@@ -185,7 +189,9 @@ def _list_checkpoint_dirs(checkpoint_dir: Path) -> list[Path]:
     if not checkpoint_dir.exists():
         return results
     for entry in checkpoint_dir.iterdir():
-        if entry.is_dir() and entry.name.startswith("ckpt_") and not entry.name.startswith("ckpt_tmp_"):
+        is_ckpt = entry.is_dir() and entry.name.startswith("ckpt_")
+        is_tmp = entry.name.startswith("ckpt_tmp_")
+        if is_ckpt and not is_tmp:
             results.append(entry)
     return results
 

@@ -77,7 +77,7 @@ def _sim_calibrate(connectome_name: str) -> int:
     print("Running gain calibration...")
     result = calibrate_gain(conn, target_rate_hz=(1.0, 10.0), duration_ms=1000.0)
 
-    print(f"\nCalibration result:")
+    print("\nCalibration result:")
     print(f"  Gain:       {result.gain:.8f}")
     print(f"  Mean rate:  {result.mean_rate_hz:.2f} Hz")
     print(f"  Healthy:    {result.is_healthy}")
@@ -103,7 +103,7 @@ def _sim_preflight(connectome_name: str, gain: float | None) -> int:
     print(f"\nRunning pre-flight gate with gain={gain:.8f}...")
     result = preflight_gate(conn, gain=gain)
 
-    print(f"\nPre-flight results:")
+    print("\nPre-flight results:")
     print(f"  Gate 1 (zero-input stability):  {'PASS' if result.gate1_pass else 'FAIL'}")
     print(f"  Gate 2 (non-degenerate response): {'PASS' if result.gate2_pass else 'FAIL'}")
     print(f"  Gate 3 (state discrimination):  {'PASS' if result.gate3_pass else 'FAIL'}")
@@ -356,6 +356,13 @@ def main() -> int:
         print("    --connectome NAME   Connectome to use (default: mushroom-body, or 'test')")
         print("    --iterations N      Number of training iterations (default: 100)")
         print("    --eval-interval N   Evaluate against Oracle every N iterations (default: 50)")
+        print("  dashboard render      Render 10-panel HTML dashboard")
+        print("    --telemetry PATH    Telemetry JSONL file (default: mission_telemetry.jsonl)")
+        print("    --output PATH       Output HTML path (default: dashboard.html)")
+        print("  avatar ascii          Render ASCII fly avatar")
+        print("    --fci VALUE         FCI value 0-1 (default: 0.5)")
+        print("    --event NAME        Economy event (round_win, forced_eco, etc.)")
+        print("  resilience status     Show heartbeats, ladder level, last checkpoint")
         return 0
 
     if args[0] == "oracle":
@@ -466,6 +473,111 @@ def main() -> int:
             if idx + 1 < len(args):
                 eval_interval = int(args[idx + 1])
         return _train(connectome_name, iterations, eval_interval)
+
+    if args[0] == "dashboard":
+        if len(args) < 2:
+            print("Usage: python -m flyecon dashboard {render}")
+            return 1
+
+        if args[1] == "render":
+            telemetry_path = "mission_telemetry.jsonl"
+            if "--telemetry" in args:
+                idx = args.index("--telemetry")
+                if idx + 1 < len(args):
+                    telemetry_path = args[idx + 1]
+
+            output_path = "dashboard.html"
+            if "--output" in args:
+                idx = args.index("--output")
+                if idx + 1 < len(args):
+                    output_path = args[idx + 1]
+
+            from flyecon.dashboard.renderer import render_dashboard
+            from flyecon.dashboard.telemetry import TelemetryStore
+
+            store = TelemetryStore(Path(telemetry_path))
+            result = render_dashboard(store, Path(output_path))
+            print(f"Dashboard rendered to {result}")
+            return 0
+
+        print(f"Unknown dashboard command: {args[1]}")
+        return 1
+
+    if args[0] == "avatar":
+        if len(args) < 2:
+            print("Usage: python -m flyecon avatar {ascii}")
+            return 1
+
+        if args[1] == "ascii":
+            fci_val = 0.5
+            if "--fci" in args:
+                idx = args.index("--fci")
+                if idx + 1 < len(args):
+                    fci_val = float(args[idx + 1])
+
+            event_name = ""
+            if "--event" in args:
+                idx = args.index("--event")
+                if idx + 1 < len(args):
+                    event_name = args[idx + 1]
+
+            from flyecon.avatar.ascii import ASCIIAvatar
+
+            avatar = ASCIIAvatar()
+            print(avatar.render(fci=fci_val, event=event_name))
+            return 0
+
+        print(f"Unknown avatar command: {args[1]}")
+        return 1
+
+    if args[0] == "resilience":
+        if len(args) < 2:
+            print("Usage: python -m flyecon resilience {status}")
+            return 1
+
+        if args[1] == "status":
+            from flyecon.resilience.checkpoint import load_checkpoint
+            from flyecon.resilience.heartbeat import HeartbeatWatcher
+            from flyecon.resilience.ladder import DegradationLadder, probe_resources
+
+            # Heartbeats
+            hb_dir = Path("heartbeats")
+            watcher = HeartbeatWatcher(hb_dir, timeout_s=90)
+            reports = watcher.check_all()
+            print("Component Heartbeats:")
+            if reports:
+                for r in reports:
+                    print(f"  {r.component}: {r.status.value} (age: {r.age_s:.1f}s)")
+            else:
+                print("  No heartbeats found.")
+
+            # Ladder
+            report = probe_resources()
+            ladder = DegradationLadder()
+            level = ladder.decide_level(report)
+            print(f"\nDegradation Ladder: Level {level}")
+            print(f"  RAM: {report.available_ram_mb:.0f} MB")
+            print(f"  CPUs: {report.cpu_count}")
+            print(f"  Disk: {report.available_disk_mb:.0f} MB")
+
+            # Last checkpoint
+            ckpt_dir = Path("checkpoints")
+            bundle = load_checkpoint(ckpt_dir)
+            if bundle:
+                ms = bundle.mission_state
+                print("\nLast Checkpoint:")
+                print(f"  Stage: {ms.stage.value}")
+                print(f"  Step: {ms.training_step}")
+                print(f"  Candidate: {ms.candidate_id}")
+                print(f"  Ladder level: {ms.ladder_level}")
+                print(f"  Last eval score: {ms.last_eval_score:.4f}")
+            else:
+                print("\nNo checkpoint found.")
+
+            return 0
+
+        print(f"Unknown resilience command: {args[1]}")
+        return 1
 
     print(f"Unknown command: {args[0]}")
     return 1
