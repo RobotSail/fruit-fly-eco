@@ -204,8 +204,102 @@ def oracle_solver() -> dict[str, Any]:
 
 
 def connectome_etl() -> dict[str, Any]:
-    """Stub — returns 0.0 until Phase 3."""
-    return _dim_result(0.0, "Not implemented until Phase 3")
+    """Verify ETL sign convention, sparse format, int32 indices with synthetic data."""
+    errors: list[str] = []
+    checks_passed = 0
+    total_checks = 0
+
+    try:
+        import pandas as pd
+        import torch
+
+        from flyecon.etl.loader import load_connectome_from_tables
+
+        # Build a small synthetic connectome
+        weights = pd.DataFrame(
+            {
+                "bodyId_pre": [1, 1, 2, 3, 4],
+                "bodyId_post": [2, 3, 3, 4, 5],
+                "weight": [10, 5, 8, 3, 7],
+            }
+        )
+        nt = pd.DataFrame(
+            {
+                "bodyId": [1, 2, 3, 4, 5],
+                "predictedNt": [
+                    "acetylcholine",
+                    "gaba",
+                    "glutamate",
+                    "dopamine",
+                    "serotonin",
+                ],
+            }
+        )
+        ann = pd.DataFrame(
+            {"bodyId": [1, 2, 3, 4, 5], "type": ["n1", "n2", "n3", "n4", "n5"]}
+        )
+
+        conn = load_connectome_from_tables(weights, nt, ann)
+
+        # Check 1: Sign convention — ACh is positive
+        total_checks += 1
+        dense = conn.weight_matrix.to_dense()
+        if dense[0, 1].item() > 0:
+            checks_passed += 1
+        else:
+            errors.append(f"ACh edge should be positive, got {dense[0, 1].item()}")
+
+        # Check 2: GABA is negative
+        total_checks += 1
+        if dense[1, 2].item() < 0:
+            checks_passed += 1
+        else:
+            errors.append(f"GABA edge should be negative, got {dense[1, 2].item()}")
+
+        # Check 3: Dopamine in separate matrix (not in weight matrix)
+        total_checks += 1
+        if dense[3, 4].item() == 0.0:
+            checks_passed += 1
+        else:
+            errors.append(f"Dopamine edge should not be in weight_matrix, got {dense[3, 4].item()}")
+
+        # Check 4: Dopamine is in dopamine_matrix
+        total_checks += 1
+        dopa_dense = conn.dopamine_matrix.to_dense()
+        if dopa_dense[3, 4].item() > 0:
+            checks_passed += 1
+        else:
+            errors.append("Dopamine edge missing from dopamine_matrix")
+
+        # Check 5: Sparse CSR format
+        total_checks += 1
+        if conn.weight_matrix.layout == torch.sparse_csr:
+            checks_passed += 1
+        else:
+            errors.append(f"Expected sparse_csr, got {conn.weight_matrix.layout}")
+
+        # Check 6: int32 indices
+        total_checks += 1
+        if (
+            conn.weight_matrix.crow_indices().dtype == torch.int32
+            and conn.weight_matrix.col_indices().dtype == torch.int32
+        ):
+            checks_passed += 1
+        else:
+            errors.append(
+                f"Expected int32 indices, got crow={conn.weight_matrix.crow_indices().dtype}, "
+                f"col={conn.weight_matrix.col_indices().dtype}"
+            )
+
+    except Exception as e:
+        total_checks = 1
+        errors.append(f"Connectome ETL failed: {e}")
+
+    score = checks_passed / total_checks if total_checks > 0 else 0.0
+    details = f"{checks_passed}/{total_checks} checks passed"
+    if errors:
+        details += "; ERRORS: " + "; ".join(errors)
+    return _dim_result(score, details)
 
 
 def simulation_runs() -> dict[str, Any]:
