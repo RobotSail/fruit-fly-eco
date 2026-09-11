@@ -1,1 +1,1 @@
-"""FLY//ECON resilience module — stub for Phase 1."""
+"""FLY//ECON resilience module — checkpoint, heartbeat, degradation ladder."""
