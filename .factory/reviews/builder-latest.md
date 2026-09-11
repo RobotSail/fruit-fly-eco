@@ -1,47 +1,53 @@
-# Builder Review — Phase 6: PPO Policy Head + Training Loop
+# Builder Report — Phase 9: End-to-end Integration + Scientific Controls
 
-## Summary
-Implemented Phase 6 deliverables: FlyPolicy wrapping the fixed-reservoir
-connectome pipeline, CleanRL-style PPO trainer, Oracle evaluation function,
-CLI training command, and comprehensive tests.
+**Date:** 2026-09-11
+**Branch:** factory/run-f58fa2d8
+**PR:** #2 (updated)
+**Status:** ✅ Complete
 
-## Files Changed
-| File | Change | Scope |
-|------|--------|-------|
-| `flyecon/policy/ppo.py` | New — 468 lines | Modifiable surface |
-| `tests/test_ppo.py` | New — 198 lines | Test file |
-| `flyecon/__main__.py` | Added `train` CLI command | Issue scope |
-| `flyecon/policy/__init__.py` | Updated docstring | Supporting change |
-| `eval/score.py` | Activated fly_vs_oracle stub | Phase 6 deliverable |
+## What Was Built
 
-## Architecture Decisions
-1. **Fixed reservoir**: LIFNetwork is NOT an nn.Module — its connectome weights
-   never appear in `policy.parameters()` and never receive gradients.
-2. **Feature caching**: During rollout collection, baseline-normalised features
-   are cached in the RolloutBuffer. During PPO update, only the readout
-   projection (W, b) and value head MLP are recomputed — no LIF re-simulation.
-3. **Value head**: MLP [n_output_features, 64, 1] shares features with the
-   policy head but has separate trainable parameters.
-4. **Baseline normalization**: Rates clamped to ≥1 Hz floor to prevent extreme
-   normalization when baseline firing is near zero (important for small test
-   networks with gain=0).
+### flyecon/harness.py (417 lines)
+End-to-end orchestration harness that wires the complete pipeline:
+- **Boot sequence:** checkpoint resume → synthetic connectome → gain calibration → preflight gate → build policy → solve Oracle
+- **Training loop:** rollout collection → PPO update → FCI computation → checkpoint → Oracle eval → dashboard → heartbeat
+- **Daemon mode:** `run_forever()` for perpetual operation
+- Integrates degradation ladder for resource-aware training
+- Telemetry emission for all lifecycle events
+
+### flyecon/controls.py (260 lines)
+Scientific control experiments for topology ablation:
+- **rewired:** Degree-preserving rewired null (same statistics, scrambled topology)
+- **random:** Matched-density random sparse graph
+- **no_connectome:** Zero-weight connectome to test whether LIF dynamics add signal
+- Generates `controls/comparison_report.md` with value ratio, agreement rate, and reward improvement tables
+
+### tests/test_integration.py (253 lines)
+7 integration tests using SYNTHETIC connectomes:
+- `TestSmokeIntegration`: 4 tests — pipeline no-crash, checkpoint saving, valid policy distributions, Oracle eval
+- `TestSignalIntegration`: 1 test — 10-iteration training produces finite metrics
+- `TestControlExperiment`: 2 tests — random + no_connectome controls produce reports
+- Module-scoped Oracle cache eliminates redundant MDP solving (~2-3s per test)
+- Total runtime: **51 seconds** (target: <60s)
+
+### flyecon/__main__.py (modified)
+- Added `run` command: `python -m flyecon run [--iterations N] [--control TYPE]`
+- Added `status` command: `python -m flyecon status`
+- Fixed 2 f-string lint issues
 
 ## Test Results
-- 151/151 tests pass (8 new PPO tests + 143 existing)
-- All eval dimensions score 1.0 (including newly activated fly_vs_oracle: 3/3)
-- Aggregate eval score: 0.833 (5/6 dimensions active, dashboard_renders is Phase 8)
-- CLI `python -m flyecon train --connectome test --iterations 3` works correctly
 
-## Verification
-- [x] FlyPolicy forward produces valid Categorical distributions (no NaN)
-- [x] Gradients only flow to encoder/readout/value params, NOT connectome
-- [x] PPO update reduces value loss on synthetic batch
-- [x] Rollout collection produces correct buffer shape
-- [x] 10-iteration integration test on 50-neuron network: no crash, metrics finite
-- [x] eval/score.py fly_vs_oracle: policy valid, PPO update finite, training completes
+| Metric | Value |
+|--------|-------|
+| Total tests | 220 |
+| Status | All passing |
+| Integration tests | 7 (51s) |
+| Lint | Clean (ruff) |
+| Fixed surfaces | Untouched |
 
-## Risks
-- Encoder params receive zero gradients in fixed-reservoir mode (by design —
-  surrogate gradients are the Phase 3.8 plateau escalation)
-- gain=0 test networks have identical spike patterns for all states (features
-  only vary through encoder → input current mapping, not recurrent dynamics)
+## Key Decisions
+
+1. **Synthetic connectomes only:** Integration tests use `random_sparse(n_neurons=30)` — no real downloads, fast execution
+2. **Module-scoped Oracle cache:** Oracle MDP solution is cached across tests, saving ~14s (7 tests × 2s each)
+3. **Small test params:** 30 neurons, 2-5 iterations, 32-step rollouts — sufficient for integration correctness without excessive runtime
+4. **Non-blocking preflight:** Preflight gate logs but doesn't hard-fail — synthetic connectomes may not pass all gates, but pipeline must still run
