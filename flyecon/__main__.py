@@ -156,6 +156,118 @@ def _etl_load(cache_dir: str = "cache/connectome/", subcircuit: str | None = Non
     return 0
 
 
+def _encoding_test_discrimination(connectome_name: str, gain: float | None) -> int:
+    """Encode 10 economy states, simulate, read out, report pairwise distances."""
+    import torch
+
+    from flyecon.encoding.population import (
+        N_INPUT_NEURONS,
+        PopulationEncoder,
+        map_to_connectome_inputs,
+    )
+    from flyecon.readout.linear import SpikeReadout
+    from flyecon.sim.calibration import calibrate_gain
+    from flyecon.sim.lif import LIFNetwork
+    from flyecon.state.economy import EconomyState
+
+    # Load connectome
+    print(f"Loading connectome: {connectome_name}")
+    conn = _load_connectome_by_name(connectome_name)
+
+    # Calibrate gain if not provided
+    if gain is None:
+        print("No gain specified — running calibration first...")
+        cal = calibrate_gain(conn, target_rate_hz=(1.0, 10.0), duration_ms=1000.0)
+        gain = cal.gain
+        print(f"  Calibrated gain: {gain:.8f} (rate: {cal.mean_rate_hz:.2f} Hz)")
+
+    # Build encoder
+    encoder = PopulationEncoder()
+
+    # Pick input neuron IDs (first N_INPUT_NEURONS neurons in the connectome)
+    n_inputs = min(N_INPUT_NEURONS, conn.n_neurons)
+    input_ids = list(range(n_inputs))
+
+    # Define 10 diverse economy states
+    test_states = [
+        EconomyState(money=800, loss_streak=0, round_number=1, half=0, opponent_loss_streak=0),
+        EconomyState(money=16000, loss_streak=0, round_number=12, half=0, opponent_loss_streak=4),
+        EconomyState(money=4000, loss_streak=2, round_number=5, half=0, opponent_loss_streak=1),
+        EconomyState(money=8000, loss_streak=0, round_number=8, half=1, opponent_loss_streak=0),
+        EconomyState(money=2000, loss_streak=4, round_number=3, half=0, opponent_loss_streak=0),
+        EconomyState(money=6000, loss_streak=1, round_number=6, half=0, opponent_loss_streak=2),
+        EconomyState(money=10000, loss_streak=0, round_number=10, half=1, opponent_loss_streak=3),
+        EconomyState(money=1400, loss_streak=3, round_number=2, half=0, opponent_loss_streak=0),
+        EconomyState(money=12000, loss_streak=0, round_number=11, half=1, opponent_loss_streak=1),
+        EconomyState(money=5000, loss_streak=1, round_number=7, half=0, opponent_loss_streak=4),
+    ]
+
+    # Encode and simulate each state
+    duration_ms = 400.0
+    net = LIFNetwork(conn, gain=gain)
+    readout_vectors: list[torch.Tensor] = []
+
+    # Get baseline rates for readout
+    baseline_input = torch.zeros(conn.n_neurons, dtype=torch.float32)
+    baseline_counts = net.simulate(baseline_input, duration_ms, jitter=True)
+    baseline_rates = baseline_counts / (duration_ms / 1000.0)
+
+    # Pick output neuron IDs (last min(20, n_neurons) neurons)
+    n_outputs = min(20, conn.n_neurons)
+    output_ids = list(range(conn.n_neurons - n_outputs, conn.n_neurons))
+    output_baselines = baseline_rates[output_ids]
+
+    readout = SpikeReadout(
+        output_neuron_ids=output_ids,
+        baseline_rates=output_baselines,
+    )
+
+    print(f"\nEncoding {len(test_states)} economy states through the pipeline...")
+    print(f"  Connectome: {conn.n_neurons} neurons")
+    print(f"  Input neurons: {n_inputs}, Output neurons: {n_outputs}")
+    print(f"  Duration: {duration_ms} ms, Gain: {gain:.8f}")
+    print()
+
+    for i, state in enumerate(test_states):
+        encoded = encoder.encode(state)
+        # Pad encoded if fewer input IDs than N_INPUT_NEURONS
+        if n_inputs < N_INPUT_NEURONS:
+            encoded = encoded[:n_inputs]
+        full_input = map_to_connectome_inputs(encoded, input_ids, conn.n_neurons)
+        spike_counts = net.simulate(full_input, duration_ms, jitter=True)
+
+        with torch.no_grad():
+            logits = readout(spike_counts, duration_ms)
+        readout_vectors.append(logits)
+
+        print(
+            f"  State {i}: money=${state.money:>5}, streak={state.loss_streak}, "
+            f"round={state.round_number:>2}, half={state.half} "
+            f"→ logits=[{', '.join(f'{v:.3f}' for v in logits.tolist())}]"
+        )
+
+    # Compute pairwise distances
+    print("\nPairwise L2 distances between readout vectors:")
+    stacked = torch.stack(readout_vectors)
+    n = len(readout_vectors)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = float(torch.norm(stacked[i] - stacked[j]).item())
+            print(f"  states({i},{j}): {dist:.4f}")
+
+    mean_dist = 0.0
+    count = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            mean_dist += float(torch.norm(stacked[i] - stacked[j]).item())
+            count += 1
+    mean_dist /= max(count, 1)
+    print(f"\nMean pairwise distance: {mean_dist:.4f}")
+    print(f"Result: {'PASS (>0)' if mean_dist > 0 else 'FAIL (no discrimination)'}")
+
+    return 0
+
+
 def main() -> int:
     """Entry point — dispatch CLI commands."""
     args = sys.argv[1:]
@@ -174,6 +286,10 @@ def main() -> int:
         print("  sim calibrate         Run gain calibration on a connectome")
         print("    --connectome NAME   Connectome to use (default: mushroom-body)")
         print("  sim preflight         Run pre-flight gate checks")
+        print("    --connectome NAME   Connectome to use (default: mushroom-body)")
+        print("    --gain VALUE        Gain value (auto-calibrates if omitted)")
+        print("  encoding test-discrimination")
+        print("                        Encode states, simulate, report discrimination")
         print("    --connectome NAME   Connectome to use (default: mushroom-body)")
         print("    --gain VALUE        Gain value (auto-calibrates if omitted)")
         return 0
@@ -245,6 +361,28 @@ def main() -> int:
             return _etl_load(cache_dir=cache_dir, subcircuit=subcircuit)
 
         print(f"Unknown etl command: {args[1]}")
+        return 1
+
+    if args[0] == "encoding":
+        if len(args) < 2:
+            print("Usage: python -m flyecon encoding {test-discrimination}")
+            return 1
+
+        connectome_name = "mushroom-body"
+        if "--connectome" in args:
+            idx = args.index("--connectome")
+            if idx + 1 < len(args):
+                connectome_name = args[idx + 1]
+
+        if args[1] == "test-discrimination":
+            gain_val: float | None = None
+            if "--gain" in args:
+                idx = args.index("--gain")
+                if idx + 1 < len(args):
+                    gain_val = float(args[idx + 1])
+            return _encoding_test_discrimination(connectome_name, gain_val)
+
+        print(f"Unknown encoding command: {args[1]}")
         return 1
 
     print(f"Unknown command: {args[0]}")

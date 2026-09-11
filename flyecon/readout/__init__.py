@@ -1,1 +1,1 @@
-"""FLY//ECON readout module — stub for Phase 1."""
+"""FLY//ECON readout module — learned linear spike readout."""

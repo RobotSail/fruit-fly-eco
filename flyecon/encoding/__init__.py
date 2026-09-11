@@ -1,1 +1,1 @@
-"""FLY//ECON encoding module — stub for Phase 1."""
+"""FLY//ECON encoding module — population-coded state encoding."""
