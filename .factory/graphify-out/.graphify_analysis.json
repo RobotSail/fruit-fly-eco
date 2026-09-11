@@ -1,0 +1,23 @@
+{
+  "communities": {
+    "0": [
+      "factory_hooks_verify_design",
+      "factory_hooks_verify_design_sh__entry"
+    ]
+  },
+  "cohesion": {
+    "0": 1.0
+  },
+  "gods": [
+    {
+      "id": "factory_hooks_verify_design_sh__entry",
+      "label": "verify-design.sh script",
+      "degree": 1
+    }
+  ],
+  "surprises": [],
+  "tokens": {
+    "input": 0,
+    "output": 0
+  }
+}
