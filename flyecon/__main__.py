@@ -49,6 +49,71 @@ def _oracle_eval(episodes: int = 1000) -> int:
     return 0
 
 
+def _load_connectome_by_name(name: str) -> object:
+    """Load connectome, optionally extracting a subcircuit."""
+    from flyecon.etl.loader import load_connectome
+
+    conn = load_connectome()
+
+    if name == "mushroom-body":
+        from flyecon.etl.subcircuit import extract_mushroom_body
+
+        return extract_mushroom_body(conn, hops=1)
+    elif name == "full":
+        return conn
+    else:
+        from flyecon.etl.subcircuit import extract_by_roi
+
+        return extract_by_roi(conn, name)
+
+
+def _sim_calibrate(connectome_name: str) -> int:
+    """Run gain calibration on the specified connectome."""
+    from flyecon.sim.calibration import calibrate_gain
+
+    print(f"Loading connectome: {connectome_name}")
+    conn = _load_connectome_by_name(connectome_name)
+
+    print("Running gain calibration...")
+    result = calibrate_gain(conn, target_rate_hz=(1.0, 10.0), duration_ms=1000.0)
+
+    print(f"\nCalibration result:")
+    print(f"  Gain:       {result.gain:.8f}")
+    print(f"  Mean rate:  {result.mean_rate_hz:.2f} Hz")
+    print(f"  Healthy:    {result.is_healthy}")
+    print(f"  Trials:     {len(result.trials)}")
+    for i, trial in enumerate(result.trials):
+        print(f"    [{i}] gain={trial['gain']:.8f}  rate={trial['rate_hz']:.2f} Hz")
+    return 0
+
+
+def _sim_preflight(connectome_name: str, gain: float | None) -> int:
+    """Run pre-flight gate on the specified connectome."""
+    from flyecon.sim.calibration import calibrate_gain, preflight_gate
+
+    print(f"Loading connectome: {connectome_name}")
+    conn = _load_connectome_by_name(connectome_name)
+
+    if gain is None:
+        print("No gain specified — running calibration first...")
+        cal = calibrate_gain(conn, target_rate_hz=(1.0, 10.0), duration_ms=1000.0)
+        gain = cal.gain
+        print(f"  Calibrated gain: {gain:.8f} (rate: {cal.mean_rate_hz:.2f} Hz)")
+
+    print(f"\nRunning pre-flight gate with gain={gain:.8f}...")
+    result = preflight_gate(conn, gain=gain)
+
+    print(f"\nPre-flight results:")
+    print(f"  Gate 1 (zero-input stability):  {'PASS' if result.gate1_pass else 'FAIL'}")
+    print(f"  Gate 2 (non-degenerate response): {'PASS' if result.gate2_pass else 'FAIL'}")
+    print(f"  Gate 3 (state discrimination):  {'PASS' if result.gate3_pass else 'FAIL'}")
+    print(f"  Overall: {'ALL PASS' if result.all_pass else 'FAILED'}")
+
+    for k, v in result.diagnostics.items():
+        print(f"    {k}: {v}")
+    return 0 if result.all_pass else 1
+
+
 def _etl_download(cache_dir: str = "cache/connectome/") -> int:
     """Download Feather tables from GCS."""
     from flyecon.etl.loader import download_feather_tables
@@ -106,6 +171,11 @@ def main() -> int:
         print("    --cache-dir DIR     Cache directory (default: cache/connectome/)")
         print("  etl load              Load connectome from cached Feather tables")
         print("    --subcircuit NAME   Extract subcircuit (e.g. mushroom-body)")
+        print("  sim calibrate         Run gain calibration on a connectome")
+        print("    --connectome NAME   Connectome to use (default: mushroom-body)")
+        print("  sim preflight         Run pre-flight gate checks")
+        print("    --connectome NAME   Connectome to use (default: mushroom-body)")
+        print("    --gain VALUE        Gain value (auto-calibrates if omitted)")
         return 0
 
     if args[0] == "oracle":
@@ -125,6 +195,31 @@ def main() -> int:
             return _oracle_eval(episodes)
 
         print(f"Unknown oracle command: {args[1]}")
+        return 1
+
+    if args[0] == "sim":
+        if len(args) < 2:
+            print("Usage: python -m flyecon sim {calibrate|preflight}")
+            return 1
+
+        connectome_name = "mushroom-body"
+        if "--connectome" in args:
+            idx = args.index("--connectome")
+            if idx + 1 < len(args):
+                connectome_name = args[idx + 1]
+
+        if args[1] == "calibrate":
+            return _sim_calibrate(connectome_name)
+
+        if args[1] == "preflight":
+            gain_val: float | None = None
+            if "--gain" in args:
+                idx = args.index("--gain")
+                if idx + 1 < len(args):
+                    gain_val = float(args[idx + 1])
+            return _sim_preflight(connectome_name, gain_val)
+
+        print(f"Unknown sim command: {args[1]}")
         return 1
 
     if args[0] == "etl":

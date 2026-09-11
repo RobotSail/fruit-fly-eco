@@ -33,7 +33,7 @@
 | economy_mdp | eval/score.py | ✅ Active (Phase 1) |
 | oracle_solver | eval/score.py | ⬚ Stub (Phase 2) |
 | connectome_etl | eval/score.py | ✅ Active (Phase 3) |
-| simulation_runs | eval/score.py | ⬚ Stub (Phase 4) |
+| simulation_runs | eval/score.py | ✅ Active (Phase 4) |
 | fly_vs_oracle | eval/score.py | ⬚ Stub (Phase 6) |
 | dashboard_renders | eval/score.py | ⬚ Stub (Phase 8) |
 

@@ -1,66 +1,53 @@
-# Builder Review — Phase 2: Baseline Oracle
+# Builder Review — Phase 4: LIF simulation + gain calibration
 
 ## Summary
-Implemented the Baseline Oracle as a NumPy value-iteration solver over the
-MR12 economy MDP. The Oracle is a standalone, zero-connectome-dependency
-component that solves the full state space (~96,600 states) and produces
-optimal buy-plan decisions.
 
-## Changes
+Phase 4 implements the LIF (Leaky Integrate-and-Fire) simulation core with exact/exponential integration, sparse CSR matmul for synaptic current, gain calibration via binary search, and a 3-gate preflight validation system.
 
-### flyecon/oracle/mdp.py (new)
-- `EconomyMDP` class with full state space: money (161 buckets) × loss_streak (5) × round (12) × half (2) × opp_loss_streak (5) = 96,600 states
-- Parameterised win-probability model (`DEFAULT_WIN_PROBS`) — tunable, documented
-- `transition()` delegates to `flyecon.state.economy.step()` — Oracle shares exact MR12 rules
-- Affordability masking: unaffordable actions return empty transitions (solver uses -inf Q)
-- Terminal state detection: round 12 half 1 is absorbing (match over)
-- Reward: 1.0 for win, 0.0 for loss (Oracle maximises expected round wins)
+## Files Changed
 
-### flyecon/oracle/solver.py (new)
-- `solve(mdp, gamma=0.99, tol=1e-8)` → `Policy` via NumPy value iteration
-- Per-state gamma: terminal states use γ=0, ensuring fast convergence (25 iterations)
-- Vectorised VI loop: precomputed transition arrays for O(1) per-step
-- `Policy` class with `decide(state)`, `value(state)`, `summary()`
-- `simulate_episode()` stochastic simulation with win-probability model
-- `verify_against_random()` → `VerificationResult` with wins and money metrics
+| File | Lines | Action |
+|---|---|---|
+| `flyecon/sim/lif.py` | 219 | NEW — LIF network with exact integration |
+| `flyecon/sim/calibration.py` | 309 | NEW — Gain calibration + preflight gate |
+| `tests/test_lif.py` | 279 | NEW — 9 tests for LIF core |
+| `tests/test_calibration.py` | 252 | NEW — 6 tests for calibration |
+| `eval/score.py` | 467 | MODIFIED — simulation_runs dimension (5 checks) |
+| `flyecon/__main__.py` | 255 | MODIFIED — sim calibrate/preflight CLI |
+| `flyecon/sim/__init__.py` | 1 | MODIFIED — docstring update |
+| `factory.md` | 87 | MODIFIED — simulation_runs → ✅ Active |
 
-### tests/test_oracle.py (new, 16 tests)
-- State space size = 96,600
-- Index roundtrip consistency
-- Transition probabilities sum to 1 for affordable actions
-- Convergence in <100 iterations (actual: 25)
-- Policy never chooses FULL_BUY when money < $4,750
-- Pistol round ($800) never picks FULL_BUY
-- Rich state ($10,000) never picks SAVE
-- Oracle dominates random by ≥1.0 rounds/match (actual: ~1.7)
+## Key Implementation Details
 
-### eval/score.py (updated oracle_solver stub)
-- 4 checks: convergence, affordability, pistol sanity, Oracle vs random
+### Exact/Exponential Integration (lif.py)
+- Uses closed-form subthreshold update: `V_new = V_REST + (V - V_REST) * decay + I_total * TAU_MS * (1 - decay) / C_M`
+- `decay = exp(-DT_MS / TAU_MS)` pre-computed as module constant
+- `C_M = TAU_MS` so that current in mV-equivalent directly drives voltage (V_ss = V_rest + I)
+- Sparse CSR matmul: `I_syn = gain * torch.mv(W_csr, prev_spikes)`
+- Refractory period: 2ms (neurons held at V_REST during refractory)
+- All float32, CPU default
 
-### flyecon/__main__.py (updated CLI)
-- `python -m flyecon oracle solve` — solve MDP, print summary, cache to checkpoints/
-- `python -m flyecon oracle eval --episodes N` — Oracle vs random evaluation
+### Jittered Initialization (critical fix)
+- **Problem discovered**: With uniform input and identical initial conditions, all neurons spike in perfect synchrony. Synaptic feedback arrives during refractory periods and is completely masked, making recurrent dynamics invisible.
+- **Fix**: Added `jitter` parameter to `reset()` and `simulate()`. When enabled, initializes membrane potentials uniformly between V_REST and V_THRESH, breaking artificial synchrony.
+- Calibration and preflight Gate 2/3 use jitter by default; Gate 1 (zero-input stability) does not.
 
-## Key Design Decisions
+### Calibration Algorithm (calibration.py)
+- Phase 1: Scan gain decades from 1e-6 to 1e3 (covers both small test networks and real connectomes)
+- Phase 2: Find bracket where firing rate crosses target range [1, 10] Hz
+- Phase 3: Binary search within bracket (geometric midpoint, direction-aware)
+- Handles both excitation-dominated (rate increases with gain) and inhibition-dominated (rate decreases with gain) networks
 
-1. **Round-win reward** (not money): Using raw money as reward makes SAVE dominant
-   (not spending = more money). Round-win reward correctly incentivises the
-   Oracle to manage money as a means to winning rounds.
+### Preflight Gate (calibration.py)
+- Gate 1: Zero-input stability — rate < 0.1 Hz with no input
+- Gate 2: Non-degenerate response — rate in [1, 10] Hz with moderate input
+- Gate 3: State discrimination — Cohen's d > 0.5 between low/high input conditions
 
-2. **Terminal states**: Round 12 half 1 creates a self-loop in economy.step().
-   Without γ=0 at terminal states, VI took 2,800+ iterations. With per-state
-   gamma, convergence is 25 iterations.
+## Test Results
+- **106 tests passing** (15 new for Phase 4)
+- **Eval scores**: economy_mdp=1.0, oracle_solver=1.0, connectome_etl=1.0, simulation_runs=1.0
+- **Aggregate**: 0.667 (4/6 dimensions active)
 
-3. **Affordability masking**: Unaffordable actions map to -inf Q values, ensuring
-   the policy never recommends buying equipment the team can't afford.
-
-4. **VerificationResult**: Returns both money and wins metrics. The Oracle
-   wins ~1.7 more rounds/match than random but accumulates less money (it
-   spends on equipment). The wins advantage × WIN_REWARD ≈ $5,500 money-equivalent.
-
-## Metrics
-- All 62 tests pass (46 Phase 1 + 16 Phase 2)
-- eval/score.py: economy_mdp 1.0, oracle_solver 1.0
-- Solve time: ~5 seconds (including precomputation)
-- Convergence: 25 iterations
-- Oracle wins advantage: ~1.7 rounds/match over random
+## Blockers / Notes
+- The weight matrix convention in ETL uses rows=pre-synaptic, cols=post-synaptic. `torch.mv(W, spikes)` computes outgoing-weight sums rather than incoming. This works for calibration (jitter breaks synchrony → both conventions produce rate modulation) but should be reviewed for Phase 5 (encoding/readout) where the directional correctness of synaptic current matters.
+- Test networks use mixed E/I with 30% excitatory / 70% inhibitory and inhibitory weight magnitude 5.0 to ensure calibration is meaningful (recurrent inhibition can suppress firing rate into target range).

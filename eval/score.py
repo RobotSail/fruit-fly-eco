@@ -303,8 +303,130 @@ def connectome_etl() -> dict[str, Any]:
 
 
 def simulation_runs() -> dict[str, Any]:
-    """Stub — returns 0.0 until Phase 4."""
-    return _dim_result(0.0, "Not implemented until Phase 4")
+    """Verify LIF simulation core: exact integration, refractory, calibration."""
+    errors: list[str] = []
+    checks_passed = 0
+    total_checks = 0
+
+    try:
+        import math
+
+        import torch
+
+        from flyecon.etl.controls import random_sparse
+        from flyecon.sim.calibration import calibrate_gain, preflight_gate
+        from flyecon.sim.lif import C_M, LIFNetwork, _DECAY, _ONE_MINUS_DECAY
+        from flyecon.state.constants import DT_MS, TAU_MS, V_REST_MV, V_THRESH_MV
+
+        # Check 1: Zero input → no spikes, V stays at V_REST
+        total_checks += 1
+        conn10 = random_sparse(n_neurons=10, density=0.1, seed=42)
+        net = LIFNetwork(conn10, gain=0.001)
+        zero_inp = torch.zeros(10, dtype=torch.float32)
+        counts = net.simulate(zero_inp, duration_ms=500.0)
+        if float(counts.sum().item()) == 0.0:
+            checks_passed += 1
+        else:
+            errors.append(f"Zero input produced spikes: {counts.sum().item()}")
+
+        # Check 2: Exact integration matches forward Euler (dt=0.01ms) to <1%
+        total_checks += 1
+        I_test = 3.0  # subthreshold
+        duration = 100.0
+        # Exact
+        net_e = LIFNetwork(conn10, gain=0.0)
+        inp_e = torch.full((10,), I_test, dtype=torch.float32)
+        for _ in range(int(duration / DT_MS)):
+            net_e.step(inp_e)
+        V_exact = net_e.V.clone()
+        # Forward Euler dt=0.01
+        dt_fe = 0.01
+        V_fe = torch.full((10,), V_REST_MV, dtype=torch.float32)
+        for _ in range(int(duration / dt_fe)):
+            dV = (-(V_fe - V_REST_MV) / TAU_MS + I_test / C_M) * dt_fe
+            V_fe = V_fe + dV
+        max_err = float(torch.max(torch.abs(V_exact - V_fe) / (torch.abs(V_fe - V_REST_MV) + 1e-8)).item())
+        if max_err < 0.01:
+            checks_passed += 1
+        else:
+            errors.append(f"Exact vs Euler error: {max_err:.4f} (expected <0.01)")
+
+        # Check 3: Refractory prevents double-spike within 2ms
+        total_checks += 1
+        conn1 = random_sparse(n_neurons=1, density=0.0, seed=0)
+        net_r = LIFNetwork(conn1, gain=0.0)
+        inp_r = torch.tensor([50.0], dtype=torch.float32)
+        spike_times: list[float] = []
+        for t in range(200):
+            spikes = net_r.step(inp_r)
+            if spikes[0]:
+                spike_times.append(t * DT_MS)
+        if len(spike_times) >= 2:
+            min_isi = min(spike_times[i] - spike_times[i - 1] for i in range(1, len(spike_times)))
+            if min_isi >= DT_MS + DT_MS:
+                checks_passed += 1
+            else:
+                errors.append(f"Minimum ISI {min_isi}ms < {DT_MS + DT_MS}ms")
+        else:
+            errors.append(f"Too few spikes ({len(spike_times)}) to check refractory")
+
+        # Check 4: Calibration finds healthy gain on mixed E/I network
+        # All-excitatory networks can't be calibrated (gain only increases
+        # rate).  A mixed E/I network with net inhibition lets gain control
+        # the rate by modulating recurrent inhibitory feedback.
+        total_checks += 1
+        import numpy as np
+
+        from flyecon.etl.loader import Connectome, build_csr_tensor
+
+        _rng = np.random.default_rng(42)
+        _n, _dens, _ei = 100, 0.15, 0.3
+        _n_poss = _n * (_n - 1)
+        _n_edges = int(_n_poss * _dens)
+        _flat = _rng.choice(_n_poss, size=_n_edges, replace=False)
+        _rows = _flat // (_n - 1)
+        _cols = _flat % (_n - 1)
+        _cols = np.where(_cols >= _rows, _cols + 1, _cols)
+        _is_e = _rng.random(_n_edges) < _ei
+        _vals = np.where(_is_e, 1.0, -5.0).astype(np.float32)
+        _W = build_csr_tensor(
+            _rows.astype(np.int64), _cols.astype(np.int64), _vals, _n,
+        )
+        _empty = build_csr_tensor(
+            np.array([], dtype=np.int64),
+            np.array([], dtype=np.int64),
+            np.array([], dtype=np.float32),
+            _n,
+        )
+        conn100 = Connectome(
+            weight_matrix=_W, dopamine_matrix=_empty,
+            body_ids=np.arange(_n, dtype=np.int64),
+            neuron_types={}, n_neurons=_n, n_synapses=_n_edges,
+            metadata={"control": "mixed_ei"},
+        )
+        cal = calibrate_gain(conn100, target_rate_hz=(1.0, 10.0), duration_ms=500.0)
+        if cal.is_healthy:
+            checks_passed += 1
+        else:
+            errors.append(f"Calibration failed: gain={cal.gain:.6f}, rate={cal.mean_rate_hz:.2f} Hz")
+
+        # Check 5: Preflight rejects gain=0 with zero input
+        total_checks += 1
+        pf = preflight_gate(conn100, gain=0.0, duration_ms=500.0, input_amplitude=0.0)
+        if not pf.all_pass:
+            checks_passed += 1
+        else:
+            errors.append("Preflight should reject gain=0 with zero input")
+
+    except Exception as e:
+        total_checks = max(total_checks, 1)
+        errors.append(f"Simulation runs failed: {e}")
+
+    score = checks_passed / total_checks if total_checks > 0 else 0.0
+    details = f"{checks_passed}/{total_checks} checks passed"
+    if errors:
+        details += "; ERRORS: " + "; ".join(errors)
+    return _dim_result(score, details)
 
 
 def fly_vs_oracle() -> dict[str, Any]:

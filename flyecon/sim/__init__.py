@@ -1,1 +1,1 @@
-"""FLY//ECON sim module — stub for Phase 1."""
+"""FLY//ECON sim module — LIF simulation core + gain calibration."""
