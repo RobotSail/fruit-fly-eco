@@ -58,7 +58,7 @@ def _load_connectome_by_name(name: str) -> object:
     if name == "mushroom-body":
         from flyecon.etl.subcircuit import extract_mushroom_body
 
-        return extract_mushroom_body(conn, hops=1)
+        return extract_mushroom_body(conn, hops=0)
     elif name == "full":
         return conn
     else:
@@ -505,7 +505,7 @@ def main() -> int:
             idx = args.index("--control")
             if idx + 1 < len(args):
                 control = args[idx + 1]
-        connectome_name = "synthetic"
+        connectome_name = "mushroom-body"
         if "--connectome" in args:
             idx = args.index("--connectome")
             if idx + 1 < len(args):

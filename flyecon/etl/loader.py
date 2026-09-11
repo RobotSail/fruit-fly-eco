@@ -33,7 +33,7 @@ _BASE_URL = (
 )
 
 _FILES: dict[str, str] = {
-    "weights": "connectome-weights-male-cns-v1.0-minconf-0.5.feather",
+    "weights": "connectome-weights-male-cns-v1.0-minconf-0.5-traced-only.feather",
     "neurotransmitters": "body-neurotransmitters-male-cns-v1.0.feather",
     "annotations": "body-annotations-male-cns-v1.0-minconf-0.5.feather",
 }
@@ -203,30 +203,73 @@ def load_connectome_from_tables(
       Serotonin / octopamine / tyramine → zero-current.
       Unknown / low-confidence NT → zero-current (retain, don't drop).
     """
-    # ── NT lookup ──
-    nt_col = "predictedNt" if "predictedNt" in nt_df.columns else "consensusNt"
+    # ── NT lookup (flexible column names: new schema first, old fallback) ──
+    if "predicted_nt" in nt_df.columns:
+        nt_col = "predicted_nt"
+    elif "consensus_nt" in nt_df.columns:
+        nt_col = "consensus_nt"
+    elif "predictedNt" in nt_df.columns:
+        nt_col = "predictedNt"
+    else:
+        nt_col = "consensusNt"
+
+    # Body ID column in NT table: "body" (real schema) or "bodyId" (old/test)
+    nt_body_col = "body" if "body" in nt_df.columns else "bodyId"
+
     nt_lookup: dict[int, str] = {}
     for i in range(len(nt_df)):
-        bid = int(nt_df["bodyId"].iloc[i])
+        bid = int(nt_df[nt_body_col].iloc[i])
         nt_val = nt_df[nt_col].iloc[i]
         nt_lookup[bid] = str(nt_val).lower() if nt_val is not None else "unknown"
 
     # ── Neuron-type lookup from annotations ──
+    # Annotations use "bodyId" in both real and test schemas
+    ann_body_col = "bodyId" if "bodyId" in ann_df.columns else "body"
     neuron_types: dict[int, str] = {}
     if "type" in ann_df.columns:
         for i in range(len(ann_df)):
             t = ann_df["type"].iloc[i]
             if t is not None and str(t) != "nan" and str(t) != "None":
-                neuron_types[int(ann_df["bodyId"].iloc[i])] = str(t)
+                neuron_types[int(ann_df[ann_body_col].iloc[i])] = str(t)
+
+    # ── Traced-neuron filter (exclude non-Traced fragments) ──
+    traced_body_ids: set[int] | None = None
+    if "status" in ann_df.columns:
+        traced_body_ids = set()
+        for i in range(len(ann_df)):
+            if str(ann_df["status"].iloc[i]) == "Traced":
+                traced_body_ids.add(int(ann_df[ann_body_col].iloc[i]))
+        log.info("traced_neurons_identified", count=len(traced_body_ids))
 
     # ── Confidence filter ──
     if "confidence" in weights_df.columns:
         keep = weights_df["confidence"] >= MIN_CONFIDENCE
         weights_df = weights_df.loc[keep].reset_index(drop=True)
 
-    pre_ids = weights_df["bodyId_pre"].values
-    post_ids = weights_df["bodyId_post"].values
+    # Weight columns: "body_pre"/"body_post" (real) or "bodyId_pre"/"bodyId_post" (old/test)
+    pre_col = "body_pre" if "body_pre" in weights_df.columns else "bodyId_pre"
+    post_col = "body_post" if "body_post" in weights_df.columns else "bodyId_post"
+
+    pre_ids = weights_df[pre_col].values
+    post_ids = weights_df[post_col].values
     raw_weights = weights_df["weight"].values.astype(np.float32)
+
+    # ── Apply Traced filter to weight edges (vectorized via np.isin) ──
+    if traced_body_ids:
+        traced_arr = np.array(sorted(traced_body_ids), dtype=np.int64)
+        pre_in = np.isin(pre_ids.astype(np.int64), traced_arr)
+        post_in = np.isin(post_ids.astype(np.int64), traced_arr)
+        traced_mask = pre_in & post_in
+        original_edges = len(pre_ids)
+        pre_ids = pre_ids[traced_mask]
+        post_ids = post_ids[traced_mask]
+        raw_weights = raw_weights[traced_mask]
+        log.info(
+            "traced_filter_applied",
+            original_edges=original_edges,
+            retained_edges=len(pre_ids),
+            traced_neurons=len(traced_body_ids),
+        )
 
     # ── Unique body IDs + dense-index mapping ──
     all_body_ids = np.union1d(pre_ids, post_ids)

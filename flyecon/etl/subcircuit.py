@@ -90,7 +90,8 @@ def _extract_subgraph(
 
 def extract_mushroom_body(
     connectome: Connectome,
-    hops: int = 1,
+    hops: int = 0,
+    max_neurons: int = 3000,
 ) -> Connectome:
     """Extract the mushroom-body-adjacent subgraph.
 
@@ -100,7 +101,15 @@ def extract_mushroom_body(
        synaptic connections to/from the seed set).
     3. Re-index and return the induced subgraph.
 
-    Expected size for MaleCNS v1.0: 2,000–10,000 neurons.
+    Parameters
+    ----------
+    hops : int
+        Number of hops to expand beyond seed set. Default 0 (seed-only).
+    max_neurons : int
+        Hard cap on subcircuit size. If exceeded after hop expansion,
+        falls back to seed-only set.
+
+    Expected size for MaleCNS v1.0 at hops=0: ~2,100–2,200 neurons.
     """
     # ── 1. Seed set: MB neurons ──
     seed_indices: set[int] = set()
@@ -145,6 +154,18 @@ def extract_mushroom_body(
             included.update(d_cols[d_out].tolist())
             d_in = np.isin(d_cols, seed_arr)
             included.update(d_rows[d_in].tolist())
+
+    # ── 3. Size cap: fall back to seed-only if hop expansion is too large ──
+    if len(included) > max_neurons:
+        log.warning(
+            "mb_subcircuit_capped",
+            raw_size=len(included),
+            cap=max_neurons,
+            msg="Falling back to hops=0 seed-only set",
+        )
+        included = set(seed_indices)
+        if len(included) > max_neurons:
+            log.warning("mb_seed_exceeds_cap", seed_size=len(included), cap=max_neurons)
 
     included_arr = np.array(sorted(included), dtype=np.int64)
 

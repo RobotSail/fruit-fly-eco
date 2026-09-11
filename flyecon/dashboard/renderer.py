@@ -246,10 +246,13 @@ Plotly.newPlot('fci-chart',
    font: {color:'#888'}, xaxis:{title:'Time'}, yaxis:{title:'FCI',range:[0,1]}}
 );
 Plotly.newPlot('dopamine-chart',
-  [{x: ['R1','R2','R3'], y: [0,0,0], type: 'bar',
-    marker:{color:'#ff6644'}, name:'Dopamine'}],
-  {margin:{t:10,b:30,l:40,r:10}, paper_bgcolor:'#111', plot_bgcolor:'#111',
-   font:{color:'#888'}}
+  [{x: {{ dopamine_x | tojson }}, y: {{ dopamine_ppl | tojson }}, type: 'scatter',
+    mode: 'lines', line:{color:'#ff6644'}, name:'PPL Rate'},
+   {x: {{ dopamine_x | tojson }}, y: {{ dopamine_gate | tojson }}, type: 'scatter',
+    mode: 'lines', line:{color:'#44ff66', dash:'dash'}, name:'DA Gate', yaxis:'y2'}],
+  {margin:{t:10,b:30,l:40,r:40}, paper_bgcolor:'#111', plot_bgcolor:'#111',
+   font:{color:'#888'}, yaxis:{title:'PPL Spike Rate'},
+   yaxis2:{title:'Gate Value', overlaying:'y', side:'right', range:[0.4,1.6]}}
 );
 Plotly.newPlot('distress-chart',
   [{y: [0], type: 'box', name: 'MBON Variance', marker:{color:'#ffcc00'}}],
@@ -353,6 +356,12 @@ def _extract_dashboard_data(events: list[TelemetryEvent]) -> dict[str, Any]:
         elif ev.event_type == "waking":
             wakings += 1
 
+    # Extract dopamine telemetry for real chart data
+    dopamine_events = [e for e in events if e.event_type == "dopamine_activity"]
+    dopamine_x = [f"Step {i}" for i in range(len(dopamine_events))]
+    dopamine_ppl = [e.data.get("ppl_rate", 0) for e in dopamine_events]
+    dopamine_gate = [e.data.get("dopamine_gate", 1.0) for e in dopamine_events]
+
     return {
         "fci_times": fci_times,
         "fci_values": fci_values,
@@ -366,6 +375,9 @@ def _extract_dashboard_data(events: list[TelemetryEvent]) -> dict[str, Any]:
         "last_fci": last_fci,
         "last_event": last_event,
         "wakings": wakings,
+        "dopamine_x": dopamine_x,
+        "dopamine_ppl": dopamine_ppl,
+        "dopamine_gate": dopamine_gate,
     }
 
 
@@ -454,6 +466,9 @@ def render_dashboard(
         retired=data["retired"],
         fci_times=data["fci_times"],
         fci_values=data["fci_values"],
+        dopamine_x=data["dopamine_x"],
+        dopamine_ppl=data["dopamine_ppl"],
+        dopamine_gate=data["dopamine_gate"],
         nanny_interval_s=60,
         wakings=data["wakings"],
     )

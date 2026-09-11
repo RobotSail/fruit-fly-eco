@@ -110,7 +110,7 @@ def _training_loop(harness: Harness, stop: threading.Event) -> None:
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     global _harness, _train_thread
-    _harness = Harness()
+    _harness = Harness(connectome_mode="mushroom-body")
     _stop_event.clear()
     _train_thread = threading.Thread(
         target=_training_loop, args=(_harness, _stop_event),

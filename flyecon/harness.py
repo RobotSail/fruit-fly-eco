@@ -180,7 +180,7 @@ class Harness:
         n_steps: int = 128,
         connectome: Optional[Connectome] = None,
         gain: Optional[float] = None,
-        connectome_mode: str = CONNECTOME_SYNTHETIC,
+        connectome_mode: str = CONNECTOME_MUSHROOM_BODY,
         avatar_mode: str = "ascii",
     ) -> None:
         self.n_neurons = n_neurons
@@ -238,7 +238,20 @@ class Harness:
 
         # Step 2: Build connectome if not already loaded
         if self._connectome is None:
-            self._connectome = self._load_connectome()
+            try:
+                self._connectome = self._load_connectome()
+            except Exception as exc:
+                log.error(
+                    "harness.connectome_load_failed",
+                    error=str(exc),
+                    fallback="synthetic",
+                )
+                self._connectome = random_sparse(
+                    n_neurons=self.n_neurons,
+                    density=self.density,
+                    seed=self.seed,
+                )
+                self.connectome_mode = CONNECTOME_SYNTHETIC
         self._mission.stage = MissionStage.ETL
         self._emit("mission_state", self._mission_data())
 
@@ -340,7 +353,7 @@ class Harness:
             from flyecon.etl.loader import load_connectome
             from flyecon.etl.subcircuit import extract_mushroom_body
             full = load_connectome()
-            conn = extract_mushroom_body(full, hops=1)
+            conn = extract_mushroom_body(full, hops=0)
             log.info(
                 "harness.mushroom_body_loaded",
                 n_neurons=conn.n_neurons,
@@ -488,6 +501,9 @@ class Harness:
 
                 # ── Neural activity: inspect spike counts ──
                 self._emit_neural_activity()
+
+                # ── Dopamine activity: PPL/KC/MBON population rates ──
+                self._emit_dopamine_activity()
 
                 self._mission.stage = MissionStage.TRAINING
 
@@ -680,6 +696,24 @@ class Harness:
         self._emit("neural_activity", {
             "layers": layers,
             "mean_output_rate": round(mean_output_rate, 4),
+        })
+
+    def _emit_dopamine_activity(self) -> None:
+        """Emit PPL/KC/MBON population firing rates for the Dopamine Ledger."""
+        if self._policy is None:
+            return
+
+        pop_rates = self._policy._lif.get_population_rates()
+
+        # Also get current dopamine gate value
+        gate_val = float(self._policy.get_dopamine_modulation().item())
+
+        self._emit("dopamine_activity", {
+            "ppl_rate": pop_rates.get("PPL", 0.0),
+            "kc_rate": pop_rates.get("KC", 0.0),
+            "mbon_rate": pop_rates.get("MBON", 0.0),
+            "dopamine_gate": round(gate_val, 4),
+            "n_ppl_neurons": len(self._policy._lif._ppl_indices),
         })
 
     @property

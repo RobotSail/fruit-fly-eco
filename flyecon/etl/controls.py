@@ -160,15 +160,22 @@ def random_sparse(
     n_neurons: int,
     density: float,
     seed: int,
+    with_mb_tags: bool = False,
 ) -> Connectome:
     """Generate a sparse random graph of given size and density.
 
-    All edges are excitatory (weight = +1.0).  Dopamine matrix is empty.
-    Used as a baseline control for topology ablation.
+    All edges are excitatory (weight = +1.0).  Dopamine matrix is empty
+    unless ``with_mb_tags=True``.
+
+    When with_mb_tags=True, assigns KC/MBON/PPL type labels to neuron
+    subsets and generates synthetic dopamine edges (PPL→KC/MBON),
+    enabling dopamine pathway testing without the real connectome.
     """
     rng = np.random.default_rng(seed)
     n_possible = n_neurons * (n_neurons - 1)  # no self-loops
     n_edges = int(n_possible * density)
+
+    body_ids = np.arange(n_neurons, dtype=np.int64)
 
     if n_edges == 0:
         empty = build_csr_tensor(
@@ -177,7 +184,6 @@ def random_sparse(
             np.array([], dtype=np.float32),
             n_neurons,
         )
-        body_ids = np.arange(n_neurons, dtype=np.int64)
         return Connectome(
             weight_matrix=empty,
             dopamine_matrix=empty,
@@ -200,28 +206,72 @@ def random_sparse(
     weight_matrix = build_csr_tensor(
         rows.astype(np.int64), cols.astype(np.int64), vals, n_neurons,
     )
-    empty_dopa = build_csr_tensor(
-        np.array([], dtype=np.int64),
-        np.array([], dtype=np.int64),
-        np.array([], dtype=np.float32),
-        n_neurons,
-    )
 
-    body_ids = np.arange(n_neurons, dtype=np.int64)
+    # Build neuron types and dopamine matrix
+    neuron_types: dict[int, str] = {}
+    dopa_rows: list[int] = []
+    dopa_cols: list[int] = []
+    dopa_vals: list[float] = []
+
+    if with_mb_tags:
+        # Assign ~80% KC, ~10% MBON, ~5% PPL, ~5% other
+        n_kc = int(n_neurons * 0.80)
+        n_mbon = int(n_neurons * 0.10)
+        n_ppl = int(n_neurons * 0.05)
+
+        for i in range(n_kc):
+            neuron_types[i] = f"KC-s{i}"
+        for i in range(n_kc, n_kc + n_mbon):
+            neuron_types[i] = f"MBON-{i - n_kc:02d}"
+        for i in range(n_kc + n_mbon, n_kc + n_mbon + n_ppl):
+            neuron_types[i] = f"PPL1-{i - n_kc - n_mbon:02d}"
+
+        # Generate synthetic PPL → KC/MBON dopamine edges
+        ppl_range = list(range(n_kc + n_mbon, n_kc + n_mbon + n_ppl))
+        target_range = list(range(n_kc + n_mbon))  # KC + MBON
+        if ppl_range and target_range:
+            n_dopa_edges = n_ppl * 20  # ~20 targets per PPL neuron
+            for _ in range(n_dopa_edges):
+                src = int(rng.choice(ppl_range))
+                tgt = int(rng.choice(target_range))
+                dopa_rows.append(src)
+                dopa_cols.append(tgt)
+                dopa_vals.append(1.0)
+
+    if dopa_rows:
+        dopamine_matrix = build_csr_tensor(
+            np.array(dopa_rows, dtype=np.int64),
+            np.array(dopa_cols, dtype=np.int64),
+            np.array(dopa_vals, dtype=np.float32),
+            n_neurons,
+        )
+    else:
+        dopamine_matrix = build_csr_tensor(
+            np.array([], dtype=np.int64),
+            np.array([], dtype=np.int64),
+            np.array([], dtype=np.float32),
+            n_neurons,
+        )
 
     log.info(
         "random_sparse_created",
         n_neurons=n_neurons,
         n_edges=n_edges,
         density=density,
+        mb_tagged=with_mb_tags,
     )
 
     return Connectome(
         weight_matrix=weight_matrix,
-        dopamine_matrix=empty_dopa,
+        dopamine_matrix=dopamine_matrix,
         body_ids=body_ids,
-        neuron_types={},
+        neuron_types=neuron_types,
         n_neurons=n_neurons,
         n_synapses=n_edges,
-        metadata={"control": "random", "density": density, "seed": seed},
+        metadata={
+            "control": "random",
+            "density": density,
+            "seed": seed,
+            "mb_tagged": with_mb_tags,
+        },
     )

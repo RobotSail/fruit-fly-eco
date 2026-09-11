@@ -30,6 +30,10 @@ from flyecon.state.constants import (
     ROUNDS_PER_HALF,
 )
 from flyecon.state.economy import BuyPlan, EconomyState, step
+from flyecon.oracle.calibration import (
+    CALIBRATED_WIN_PROBS,
+    load_calibrated_win_probs,
+)
 
 # ── State space dimensions ───────────────────────────────────────────────────
 
@@ -58,14 +62,11 @@ N_ACTIONS: int = len(BuyPlan)  # 5
 # assumptions that can be calibrated against match data (e.g. Xenopoulos
 # et al. 2021 OSE rankings).
 
-DEFAULT_WIN_PROBS: dict[str, float] = {
-    "FULL_BUY": 0.55,
-    "FORCE_BUY": 0.40,
-    "HALF_BUY": 0.47,
-    "ECO": 0.25,
-    "SAVE": 0.20,
-}
-"""P(win | buy_plan). Tunable modelling assumption."""
+DEFAULT_WIN_PROBS: dict[str, float] = CALIBRATED_WIN_PROBS
+"""P(win | buy_plan). Calibrated from professional CS match data.
+
+See flyecon.oracle.calibration for methodology and sources.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +144,7 @@ class EconomyMDP:
         self,
         win_probs: dict[str, float] | None = None,
     ) -> None:
-        self.win_probs = win_probs or dict(DEFAULT_WIN_PROBS)
+        self.win_probs = win_probs or load_calibrated_win_probs()
         self.n_states = N_STATES
         self.n_actions = N_ACTIONS
         self._actions = list(BuyPlan)

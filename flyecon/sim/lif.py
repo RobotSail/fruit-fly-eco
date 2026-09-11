@@ -64,6 +64,35 @@ class LIFNetwork:
         # Store weight matrix as CSR on the target device
         self._W_csr: torch.Tensor = connectome.weight_matrix.to(device)
 
+        # Store dopamine matrix and neuron-type indices
+        self._dopamine_csr: torch.Tensor = connectome.dopamine_matrix.to(device)
+        self._neuron_types: dict[int, str] = connectome.neuron_types
+
+        # Pre-compute PPL, KC, MBON index sets from neuron_types
+        self._ppl_indices: list[int] = []
+        self._kc_indices: list[int] = []
+        self._mbon_indices: list[int] = []
+        for dense_idx in range(connectome.n_neurons):
+            body_id = int(connectome.body_ids[dense_idx])
+            ntype = connectome.neuron_types.get(body_id, "")
+            if ntype.startswith("PPL"):
+                self._ppl_indices.append(dense_idx)
+            elif ntype.startswith("KC"):
+                self._kc_indices.append(dense_idx)
+            elif ntype.startswith("MBON"):
+                self._mbon_indices.append(dense_idx)
+
+        # Convert to tensors for efficient indexing
+        self._ppl_idx_t = torch.tensor(
+            self._ppl_indices, dtype=torch.long, device=device,
+        )
+        self._kc_idx_t = torch.tensor(
+            self._kc_indices, dtype=torch.long, device=device,
+        )
+        self._mbon_idx_t = torch.tensor(
+            self._mbon_indices, dtype=torch.long, device=device,
+        )
+
         # ── State tensors ──
         self.V: torch.Tensor = torch.full(
             (self.n_neurons,), V_REST_MV, dtype=torch.float32, device=device,
@@ -157,6 +186,33 @@ class LIFNetwork:
         self.spike_counts += self._prev_spikes
 
         return spikes
+
+    def get_ppl_activation(self) -> float:
+        """Return mean PPL dopaminergic neuron firing rate from last simulation.
+
+        Returns 0.0 if no PPL neurons are indexed (e.g., synthetic connectome).
+        """
+        if len(self._ppl_indices) == 0:
+            return 0.0
+        ppl_counts = self.spike_counts[self._ppl_idx_t]
+        return float(ppl_counts.mean().item())
+
+    def get_population_rates(self) -> dict[str, float]:
+        """Return mean spike counts per population (KC, MBON, PPL).
+
+        Used by dashboard telemetry for the Dopamine Ledger panel.
+        """
+        result: dict[str, float] = {}
+        for name, idx_t in [
+            ("KC", self._kc_idx_t),
+            ("MBON", self._mbon_idx_t),
+            ("PPL", self._ppl_idx_t),
+        ]:
+            if len(idx_t) > 0:
+                result[name] = float(self.spike_counts[idx_t].mean().item())
+            else:
+                result[name] = 0.0
+        return result
 
     def simulate(
         self,

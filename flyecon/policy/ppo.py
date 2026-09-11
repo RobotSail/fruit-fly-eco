@@ -74,6 +74,46 @@ class TrainingLog:
     eval_results: list[EvalMetrics] = field(default_factory=list)
 
 
+# ── DopamineGate ──────────────────────────────────────────────────────────────
+
+
+class DopamineGate(nn.Module):
+    """Differentiable dopamine-modulated reward gate.
+
+    Takes PPL neuron activation (scalar) and produces a reward-shaping
+    multiplier. Grounded in Miconi et al. (ICLR 2019) Backpropamine:
+    neuromodulated plasticity trained end-to-end via gradient descent.
+
+    The gate learns to amplify or suppress the economic reward signal
+    based on the fly's own dopaminergic neuron activity — making the
+    reward pathway biologically mediated rather than hand-coded.
+
+    Architecture: scalar PPL rate → Linear(1,8) → Tanh → Linear(8,1) → Sigmoid
+    Output range: [0.5, 1.5] (centered at 1.0 = no modulation)
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, 8),
+            nn.Tanh(),
+            nn.Linear(8, 1),
+            nn.Sigmoid(),
+        )
+        # Initialize to near-identity (output ≈ 0.5 → gate ≈ 1.0)
+        for layer in self.net:
+            if isinstance(layer, nn.Linear):
+                nn.init.zeros_(layer.weight)
+                nn.init.zeros_(layer.bias)
+
+    def forward(self, ppl_rate: torch.Tensor) -> torch.Tensor:
+        """ppl_rate: scalar tensor → reward multiplier in [0.5, 1.5]."""
+        raw = self.net(
+            ppl_rate.unsqueeze(-1) if ppl_rate.dim() == 0 else ppl_rate
+        )
+        return 0.5 + raw.squeeze(-1)  # [0.5, 1.5] range
+
+
 # ── FlyPolicy ─────────────────────────────────────────────────────────────────
 
 
@@ -110,6 +150,17 @@ class FlyPolicy(nn.Module):
             if isinstance(layer, nn.Linear):
                 nn.init.orthogonal_(layer.weight, gain=1.0)
                 nn.init.zeros_(layer.bias)
+
+        # Dopamine gate — modulates reward based on PPL activation
+        self.dopamine_gate = DopamineGate()
+
+    def get_dopamine_modulation(self) -> torch.Tensor:
+        """Get current dopamine gate value from PPL neuron activation.
+
+        Called after forward() to get the reward modulator for this step.
+        """
+        ppl_rate = self._lif.get_ppl_activation()
+        return self.dopamine_gate(torch.tensor(ppl_rate, dtype=torch.float32))
 
     def _extract_features(self, spike_counts: torch.Tensor) -> torch.Tensor:
         """Baseline-normalised readout features from spike counts."""
@@ -251,7 +302,17 @@ class PPOTrainer:
             bp = BuyPlan.SAVE
         won = float(self.rng.random()) < self._win_probs[bp.value]
         nxt = step(state, bp, round_won=won)
-        reward = (nxt.money - state.money) / MAX_MONEY
+
+        # Base economic reward
+        base_reward = (nxt.money - state.money) / MAX_MONEY
+
+        # Dopamine-modulated reward via PPL neuron activation
+        dopamine_mod = self.policy.get_dopamine_modulation()
+        reward = base_reward * float(dopamine_mod.detach())
+
+        # Store raw PPL activation for telemetry
+        self._last_ppl_activation = self.policy._lif.get_ppl_activation()
+
         done = state.round_number == 12 and state.half == 1
         return nxt, reward, done
 
@@ -505,8 +566,20 @@ def build_fly_policy(
     if output_neuron_ids is not None and len(output_neuron_ids) > 0:
         output_ids = output_neuron_ids
     else:
-        n_outputs = min(20, n)
-        output_ids = list(range(n - n_outputs, n))
+        # Use MBON-tagged neurons as output if neuron_types available
+        mbon_ids = [
+            idx for idx in range(connectome.n_neurons)
+            if connectome.neuron_types.get(
+                int(connectome.body_ids[idx]), "",
+            ).startswith("MBON")
+        ]
+        if len(mbon_ids) >= 5:  # need at least n_actions outputs
+            output_ids = mbon_ids[:min(len(mbon_ids), 60)]
+            log.info("build_fly_policy.mbon_readout", n_mbon=len(output_ids))
+        else:
+            # Fallback to last-N (original behavior for synthetic connectomes)
+            n_outputs = min(20, n)
+            output_ids = list(range(n - n_outputs, n))
 
     readout = SpikeReadout(
         output_neuron_ids=output_ids,
