@@ -328,6 +328,106 @@ def _train(
     return 0
 
 
+def _run_harness(iterations: int, control: str | None) -> int:
+    """Run the full harness (or a control experiment)."""
+    if control is not None:
+        from flyecon.controls import run_control_experiment
+
+        print(f"Running control experiment: {control}")
+        n_iter = iterations if iterations > 0 else 100
+        report = run_control_experiment(
+            control_type=control,
+            n_iterations=n_iter,
+            n_neurons=200,
+            density=0.1,
+            seed=42,
+        )
+        print(f"\nReport written to {report}")
+        print(report.read_text())
+        return 0
+
+    from flyecon.harness import Harness
+
+    harness = Harness(
+        n_neurons=200,
+        density=0.1,
+        seed=42,
+        eval_interval=50,
+        checkpoint_interval=25,
+        dashboard_interval=50,
+        n_steps=128,
+    )
+    harness.boot()
+
+    if iterations > 0:
+        print(f"Running {iterations} training iterations...")
+        metrics = harness.train_iterations(iterations)
+        print("\nFinal metrics:")
+        for k, v in metrics.items():
+            print(f"  {k}: {v:.4f}")
+        print("\nMission state:")
+        ms = harness.mission_state
+        print(f"  Stage: {ms.stage.value}")
+        print(f"  Step: {ms.training_step}")
+        print(f"  Eval score: {ms.last_eval_score:.4f}")
+        return 0
+
+    # Run forever (daemon mode)
+    print("Starting perpetual harness (Ctrl+C to stop)...")
+    try:
+        harness.run_forever()
+    except KeyboardInterrupt:
+        print("\nHarness stopped.")
+    return 0
+
+
+def _show_status() -> int:
+    """Print current mission state, heartbeat health, ladder level."""
+    from flyecon.resilience.checkpoint import load_checkpoint
+    from flyecon.resilience.heartbeat import HeartbeatWatcher
+    from flyecon.resilience.ladder import DegradationLadder, probe_resources
+
+    print("FLY//ECON Status")
+    print("=" * 50)
+
+    # Heartbeats
+    hb_dir = Path("heartbeats")
+    watcher = HeartbeatWatcher(hb_dir, timeout_s=90)
+    reports = watcher.check_all()
+    print("\nComponent Heartbeats:")
+    if reports:
+        for r in reports:
+            print(f"  {r.component}: {r.status.value} (age: {r.age_s:.1f}s)")
+    else:
+        print("  No heartbeats found.")
+
+    # Ladder
+    report = probe_resources()
+    ladder = DegradationLadder()
+    level = ladder.decide_level(report)
+    print(f"\nDegradation Ladder: Level {level}")
+    print(f"  RAM: {report.available_ram_mb:.0f} MB")
+    print(f"  CPUs: {report.cpu_count}")
+    print(f"  Disk: {report.available_disk_mb:.0f} MB")
+
+    # Last checkpoint
+    ckpt_dir = Path("checkpoints")
+    bundle = load_checkpoint(ckpt_dir)
+    if bundle:
+        ms = bundle.mission_state
+        print("\nLast Checkpoint:")
+        print(f"  Stage: {ms.stage.value}")
+        print(f"  Step: {ms.training_step}")
+        print(f"  Candidate: {ms.candidate_id}")
+        print(f"  Ladder level: {ms.ladder_level}")
+        print(f"  Last eval score: {ms.last_eval_score:.4f}")
+        print(f"  Cycles completed: {ms.cycles_completed}")
+    else:
+        print("\nNo checkpoint found.")
+
+    return 0
+
+
 def main() -> int:
     """Entry point — dispatch CLI commands."""
     args = sys.argv[1:]
@@ -336,6 +436,10 @@ def main() -> int:
         print("flyecon v0.1.0")
         print()
         print("Commands:")
+        print("  run                   Run full harness (perpetual)")
+        print("    --iterations N      Run for N iterations then exit")
+        print("    --control TYPE      Run control experiment (rewired/random/no_connectome/all)")
+        print("  status                Show mission state, heartbeats, ladder")
         print("  oracle solve          Solve MDP, print summary, cache policy")
         print("  oracle eval           Oracle vs random evaluation")
         print("    --episodes N        Number of episodes (default: 1000)")
@@ -364,6 +468,22 @@ def main() -> int:
         print("    --event NAME        Economy event (round_win, forced_eco, etc.)")
         print("  resilience status     Show heartbeats, ladder level, last checkpoint")
         return 0
+
+    if args[0] == "run":
+        iterations = 0
+        if "--iterations" in args:
+            idx = args.index("--iterations")
+            if idx + 1 < len(args):
+                iterations = int(args[idx + 1])
+        control = None
+        if "--control" in args:
+            idx = args.index("--control")
+            if idx + 1 < len(args):
+                control = args[idx + 1]
+        return _run_harness(iterations, control)
+
+    if args[0] == "status":
+        return _show_status()
 
     if args[0] == "oracle":
         if len(args) < 2:
