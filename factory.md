@@ -35,7 +35,7 @@
 | connectome_etl | eval/score.py | ✅ Active (Phase 3) |
 | simulation_runs | eval/score.py | ✅ Active (Phase 4) |
 | fly_vs_oracle | eval/score.py | ⬚ Stub (Phase 6) |
-| dashboard_renders | eval/score.py | ⬚ Stub (Phase 8) |
+| dashboard_renders | eval/score.py | ✅ Active (Phase 8) |
 
 ## Modifiable Surfaces
 

@@ -487,8 +487,124 @@ def fly_vs_oracle() -> dict[str, Any]:
 
 
 def dashboard_renders() -> dict[str, Any]:
-    """Stub — returns 0.0 until Phase 8."""
-    return _dim_result(0.0, "Not implemented until Phase 8")
+    """Verify dashboard + avatar: render, FCI, self-contained HTML."""
+    errors: list[str] = []
+    checks_passed = 0
+    total_checks = 0
+
+    try:
+        import tempfile
+        import re
+        from pathlib import Path
+
+        from flyecon.dashboard.renderer import render_dashboard
+        from flyecon.dashboard.telemetry import TelemetryEvent, TelemetryStore
+        from flyecon.avatar.ascii import ASCIIAvatar
+        from flyecon.dashboard.fci import compute_fci
+
+        # Check 1: render_dashboard produces a non-empty HTML string
+        total_checks += 1
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telem_path = Path(tmpdir) / "telemetry.jsonl"
+            store = TelemetryStore(telem_path)
+            # Seed with a few events so the dashboard has data
+            store.append(TelemetryEvent("fci", data={"fci": 0.65}))
+            store.append(TelemetryEvent("mission_state", data={
+                "uptime_seconds": 3600.0,
+                "ladder_level": 0,
+                "n_candidates": 1,
+                "cycles_completed": 10,
+            }))
+
+            out_path = Path(tmpdir) / "dashboard.html"
+            result_path = render_dashboard(store, out_path)
+            html = result_path.read_text()
+
+            if len(html) > 100 and "<html" in html.lower():
+                checks_passed += 1
+            else:
+                errors.append(
+                    f"render_dashboard produced {len(html)} chars, "
+                    f"expected >100 with <html tag"
+                )
+
+        # Check 2: ASCIIAvatar.render() produces non-empty output for
+        # various FCI values (high, mid, low)
+        total_checks += 1
+        avatar = ASCIIAvatar()
+        fci_tests = [0.1, 0.5, 0.9]
+        all_nonempty = True
+        for fci_val in fci_tests:
+            art = avatar.render(fci=fci_val)
+            if not art or not art.strip():
+                all_nonempty = False
+                errors.append(f"ASCIIAvatar.render(fci={fci_val}) returned empty")
+        if all_nonempty:
+            checks_passed += 1
+
+        # Check 3: ASCIIAvatar.render() handles event-specific poses
+        total_checks += 1
+        events_ok = True
+        for event in ["round_win", "forced_eco", "oracle_duel"]:
+            art = avatar.render(fci=0.5, event=event)
+            if not art or not art.strip():
+                events_ok = False
+                errors.append(f"ASCIIAvatar.render(event={event!r}) returned empty")
+        if events_ok:
+            checks_passed += 1
+
+        # Check 4: HTML is self-contained — no <script src="http...">,
+        # <link href="http...">, or <img src="http..."> tags that would
+        # require network access to render.  URLs *inside* inline JS
+        # strings (e.g. plotly.js copyright notices, map attribution) are
+        # fine — those are data, not resource loads.
+        total_checks += 1
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telem_path = Path(tmpdir) / "telemetry.jsonl"
+            store = TelemetryStore(telem_path)
+            store.append(TelemetryEvent("fci", data={"fci": 0.5}))
+            out_path = Path(tmpdir) / "dashboard.html"
+            result_path = render_dashboard(store, out_path)
+            html = result_path.read_text()
+
+            # Match only HTML tags that load external resources:
+            # <script src="https://...">, <link ... href="https://...">,
+            # <img src="https://...">, <iframe src="https://...">
+            external_tags = re.findall(
+                r'<(?:script|link|img|iframe)\b[^>]*(?:src|href)\s*=\s*["\']'
+                r'https?://[^"\']*["\']',
+                html,
+                re.IGNORECASE,
+            )
+            if not external_tags:
+                checks_passed += 1
+            else:
+                errors.append(
+                    f"HTML loads {len(external_tags)} external resource(s): "
+                    f"{external_tags[:3]}"
+                )
+
+        # Check 5: compute_fci returns valid values at extremes
+        total_checks += 1
+        fci_zero = compute_fci(0.0, 0.0, 0)
+        fci_max = compute_fci(20.0, 16_000.0, 5)
+        if 0.0 <= fci_zero <= 0.1 and 0.9 <= fci_max <= 1.0:
+            checks_passed += 1
+        else:
+            errors.append(
+                f"FCI extremes: zero-input={fci_zero:.3f} (expected ~0), "
+                f"max-input={fci_max:.3f} (expected ~1)"
+            )
+
+    except Exception as e:
+        total_checks = max(total_checks, 1)
+        errors.append(f"dashboard_renders failed: {e}")
+
+    score = checks_passed / total_checks if total_checks > 0 else 0.0
+    details = f"{checks_passed}/{total_checks} checks passed"
+    if errors:
+        details += "; ERRORS: " + "; ".join(errors)
+    return _dim_result(score, details)
 
 
 def run_all() -> dict[str, Any]:
