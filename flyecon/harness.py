@@ -28,6 +28,8 @@ from flyecon.policy.ppo import (
     build_fly_policy,
     evaluate_against_oracle,
 )
+from flyecon.state.constants import BUY_PLAN_COSTS
+from flyecon.state.economy import BuyPlan, EconomyState, pistol_round_state, step
 from flyecon.resilience.checkpoint import (
     CheckpointBundle,
     MissionStage,
@@ -70,6 +72,56 @@ def _find_dn_neuron_indices(connectome: Connectome) -> list[int]:
             if idx < connectome.n_neurons and connectome.body_ids[idx] == body_id:
                 dn_indices.append(idx)
     return sorted(dn_indices)
+
+
+def _build_neuron_layer_map(connectome: Connectome) -> dict[int, str]:
+    """Map each dense neuron index to a layer label string.
+
+    For real connectomes with neuron_types, uses type-prefix matching.
+    For synthetic connectomes (empty neuron_types), assigns layers by
+    index range: first 20% Input, next 40% KC, next 20% MBON,
+    next 10% DN, last 10% Other.
+    """
+    n = connectome.n_neurons
+    layer_map: dict[int, str] = {}
+
+    if connectome.neuron_types:
+        import numpy as np
+        for body_id, ntype in connectome.neuron_types.items():
+            idx = int(np.searchsorted(connectome.body_ids, body_id))
+            if idx < n and connectome.body_ids[idx] == body_id:
+                if ntype.startswith("KC"):
+                    layer_map[idx] = "KC"
+                elif ntype.startswith("MBON"):
+                    layer_map[idx] = "MBON"
+                elif ntype.startswith("DN"):
+                    layer_map[idx] = "DN"
+                elif ntype.startswith("PPL"):
+                    layer_map[idx] = "PPL"
+                else:
+                    layer_map[idx] = "Input"
+        # Fill any unmapped indices
+        for i in range(n):
+            if i not in layer_map:
+                layer_map[i] = "Other"
+    else:
+        # Synthetic mode: assign by index range
+        boundaries = [
+            (int(n * 0.2), "Input"),
+            (int(n * 0.6), "KC"),
+            (int(n * 0.8), "MBON"),
+            (int(n * 0.9), "DN"),
+            (n, "Other"),
+        ]
+        for i in range(n):
+            for boundary, label in boundaries:
+                if i < boundary:
+                    layer_map[i] = label
+                    break
+            else:
+                layer_map[i] = "Other"
+
+    return layer_map
 
 
 class Harness:
@@ -159,6 +211,7 @@ class Harness:
         self._ladder: DegradationLadder = DegradationLadder()
         self._start_time: float = time.monotonic()
         self._fci_history: list[float] = []
+        self._neuron_layer_map: dict[int, str] = {}
 
     # ── Boot sequence ────────────────────────────────────────────────────
 
@@ -188,6 +241,9 @@ class Harness:
             self._connectome = self._load_connectome()
         self._mission.stage = MissionStage.ETL
         self._emit("mission_state", self._mission_data())
+
+        # Build neuron layer map (cached for dashboard neural activity)
+        self._neuron_layer_map = _build_neuron_layer_map(self._connectome)
 
         # Step 3: Calibrate gain if needed
         # Full connectome has different E/I balance — always re-calibrate
@@ -426,6 +482,13 @@ class Harness:
                     value_ratio=round(ev.value_ratio, 4),
                     agreement=round(ev.agreement_rate, 4),
                 )
+
+                # ── Decision trace: play one MR12 episode ──
+                self._emit_decision_trace()
+
+                # ── Neural activity: inspect spike counts ──
+                self._emit_neural_activity()
+
                 self._mission.stage = MissionStage.TRAINING
 
             # Dashboard
@@ -530,6 +593,95 @@ class Harness:
             "candidate_id": self._mission.candidate_id,
         }
 
+    def _emit_decision_trace(self) -> None:
+        """Play one full MR12 episode and emit per-round decision trace.
+
+        Called from the training thread at each eval_interval checkpoint.
+        """
+        assert self._policy is not None
+        assert self._oracle is not None
+
+        import torch
+        import numpy as np
+        from flyecon.oracle.mdp import DEFAULT_WIN_PROBS
+
+        buy_plans = list(BuyPlan)
+        win_probs = DEFAULT_WIN_PROBS
+        rng = np.random.default_rng(self._mission.training_step)
+        rounds: list[dict] = []
+
+        self._policy.eval()
+        with torch.no_grad():
+            for half in range(2):
+                st = pistol_round_state(half=half)
+                for rnd in range(1, 13):
+                    dist, _, _ = self._policy.forward([st])
+                    pa = int(dist.probs.argmax().item())
+                    obp = self._oracle.decide(st)  # type: ignore[union-attr]
+                    oa = buy_plans.index(obp)
+                    agreed = pa == oa
+                    rounds.append({
+                        "round": rnd,
+                        "half": half,
+                        "money": st.money,
+                        "policy_action": buy_plans[pa].value,
+                        "oracle_action": obp.value,
+                        "agreed": agreed,
+                    })
+                    # Step the environment using policy action
+                    pbp = buy_plans[pa]
+                    eff = pbp if BUY_PLAN_COSTS[pbp.value] <= st.money else BuyPlan.SAVE
+                    nxt = step(
+                        st, eff,
+                        round_won=float(rng.random()) < win_probs[eff.value],
+                    )
+                    st = nxt
+                    if st.round_number == 1 and rnd < 12:
+                        break
+        self._policy.train()
+
+        self._emit("decision_trace", {"rounds": rounds})
+
+    def _emit_neural_activity(self) -> None:
+        """Inspect spike counts and emit layer-aggregated neural activity.
+
+        Called from the training thread at each eval_interval checkpoint.
+        """
+        assert self._policy is not None
+
+        import torch
+
+        info = self._policy.inspect(pistol_round_state(half=0))
+        spike_counts = info["spike_counts"]
+        n = spike_counts.shape[0]
+
+        # Aggregate by layer
+        layer_sums: dict[str, float] = {}
+        layer_counts: dict[str, int] = {}
+        for idx in range(n):
+            layer = self._neuron_layer_map.get(idx, "Other")
+            layer_sums[layer] = layer_sums.get(layer, 0.0) + float(spike_counts[idx].item())
+            layer_counts[layer] = layer_counts.get(layer, 0) + 1
+
+        layers: dict[str, float] = {}
+        for layer, total in layer_sums.items():
+            cnt = layer_counts[layer]
+            layers[layer] = round(total / max(cnt, 1), 4)
+
+        # mean_output_rate: average of output neuron rates
+        output_ids = self._policy.readout.output_neuron_ids
+        n_out = len(output_ids)
+        if n_out > 0:
+            out_rates = [float(spike_counts[int(i)].item()) for i in output_ids]
+            mean_output_rate = sum(out_rates) / n_out
+        else:
+            mean_output_rate = 0.0
+
+        self._emit("neural_activity", {
+            "layers": layers,
+            "mean_output_rate": round(mean_output_rate, 4),
+        })
+
     @property
     def mission_state(self) -> MissionState:
         """Current mission state (read-only access)."""
@@ -539,3 +691,13 @@ class Harness:
     def policy(self) -> Optional[FlyPolicy]:
         """Current policy (read-only access)."""
         return self._policy
+
+    @property
+    def connectome(self) -> Optional[Connectome]:
+        """Current connectome (read-only access)."""
+        return self._connectome
+
+    @property
+    def neuron_layer_map(self) -> dict[int, str]:
+        """Cached neuron index → layer label map."""
+        return self._neuron_layer_map

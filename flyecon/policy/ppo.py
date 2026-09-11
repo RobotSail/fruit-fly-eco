@@ -148,6 +148,38 @@ class FlyPolicy(nn.Module):
         values = self.value_head(features).squeeze(-1)
         return Categorical(logits=logits), values
 
+    def inspect(
+        self, state: EconomyState,
+    ) -> dict:
+        """Dashboard-only tap: run a single forward pass and return internals.
+
+        Called exclusively from the training thread (never from FastAPI
+        handlers).  Returns spike_counts, action, value, and features
+        under ``torch.no_grad()``.
+        """
+        encoded = self.encoder.encode_batch([state])
+        n_in = len(self.input_neuron_ids)
+        if n_in < encoded.shape[-1]:
+            encoded = encoded[:, :n_in]
+        full_input = map_to_connectome_inputs(
+            encoded, self.input_neuron_ids, self._lif.n_neurons,
+        )
+        with torch.no_grad():
+            spike_counts = self._lif.batched_simulate(
+                full_input, self.duration_ms,
+            )
+        features = self._extract_features(spike_counts)
+        logits = F.linear(features, self.readout.W, self.readout.b)
+        values = self.value_head(features).squeeze(-1)
+        dist = Categorical(logits=logits)
+        action = int(dist.probs.argmax().item())
+        return {
+            "spike_counts": spike_counts.squeeze(0),
+            "action": action,
+            "value": float(values.item()),
+            "features": features.detach().squeeze(0),
+        }
+
     def act(
         self, state: EconomyState,
     ) -> tuple[int, float, float, torch.Tensor]:

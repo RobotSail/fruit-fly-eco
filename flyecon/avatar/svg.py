@@ -27,7 +27,30 @@ def _resolve_body_color(fci: float) -> str:
     return "#6B4226"  # dull brown — distressed
 
 
-def to_html(fci: float, event: str) -> str:
+def _glow_params(neural_activity: float | None) -> tuple[float, float, str]:
+    """Compute glow intensity, pulse duration, and glow color from activity.
+
+    Returns (intensity 0-1, pulse_duration_s, css_color).
+    """
+    if neural_activity is None or neural_activity <= 0:
+        return 0.0, 3.0, "rgba(0,255,136,0.0)"
+    # Clamp to [0, 1] range for parameterization
+    a = min(max(neural_activity, 0.0), 1.0)
+    intensity = 0.2 + a * 0.7  # 0.2 → 0.9
+    pulse_dur = 3.0 - a * 2.6   # 3.0s → 0.4s
+    # Color: blend from green to amber at high activity
+    if a > 0.7:
+        color = f"rgba(255,204,0,{intensity:.2f})"
+    else:
+        color = f"rgba(0,255,136,{intensity:.2f})"
+    return intensity, pulse_dur, color
+
+
+def to_html(
+    fci: float,
+    event: str,
+    neural_activity: float | None = None,
+) -> str:
     """Return a self-contained HTML snippet with an animated SVG fruit fly.
 
     Parameters
@@ -36,6 +59,9 @@ def to_html(fci: float, event: str) -> str:
         Fly Confidence Index ∈ [0, 1].
     event : str
         Current economy event name (unused visually but reserved).
+    neural_activity : float | None
+        Mean output neuron rate. Controls glow intensity and pulse speed.
+        ``None`` disables glow.
 
     Returns
     -------
@@ -44,11 +70,17 @@ def to_html(fci: float, event: str) -> str:
     """
     duration = _wing_beat_duration(fci)
     stripe_color = _resolve_body_color(fci)
+    glow_intensity, glow_pulse_dur, glow_color = _glow_params(neural_activity)
+    glow_visible = "visible" if glow_intensity > 0 else "hidden"
 
+    # Scale factor ~1.33x for 400x520 viewBox (original 300x420)
+    # All coordinates scaled inline below.
     return f"""\
 <style>
   :root {{
     --wing-beat-duration: {duration:.3f}s;
+    --glow-intensity: {glow_intensity:.2f};
+    --glow-pulse-duration: {glow_pulse_dur:.2f}s;
   }}
   .fly-svg {{
     display: block;
@@ -66,17 +98,17 @@ def to_html(fci: float, event: str) -> str:
     100% {{ transform: rotate(5deg) scaleY(1.0); }}
   }}
   .wing-left {{
-    transform-origin: 150px 160px;
+    transform-origin: 200px 213px;
     animation: wingBeatLeft var(--wing-beat-duration) ease-in-out infinite;
   }}
   .wing-right {{
-    transform-origin: 150px 160px;
+    transform-origin: 200px 213px;
     animation: wingBeatRight var(--wing-beat-duration) ease-in-out infinite;
   }}
   /* ── Body bob ────────────────────────────── */
   @keyframes bodyBob {{
     0%   {{ transform: translateY(0px); }}
-    50%  {{ transform: translateY(-4px); }}
+    50%  {{ transform: translateY(-5px); }}
     100% {{ transform: translateY(0px); }}
   }}
   .fly-body-group {{
@@ -94,11 +126,11 @@ def to_html(fci: float, event: str) -> str:
     100% {{ transform: rotate(0deg); }}
   }}
   .legs-left {{
-    transform-origin: 140px 195px;
+    transform-origin: 187px 260px;
     animation: legWiggleLeft 0.8s ease-in-out infinite;
   }}
   .legs-right {{
-    transform-origin: 160px 195px;
+    transform-origin: 213px 260px;
     animation: legWiggleRight 0.8s ease-in-out infinite 0.1s;
   }}
   /* ── Antenna sway ────────────────────────── */
@@ -108,17 +140,28 @@ def to_html(fci: float, event: str) -> str:
     100% {{ transform: rotate(0deg); }}
   }}
   .antenna-left {{
-    transform-origin: 140px 100px;
+    transform-origin: 187px 133px;
     animation: antennaSway 2.0s ease-in-out infinite;
   }}
   .antenna-right {{
-    transform-origin: 160px 100px;
+    transform-origin: 213px 133px;
     animation: antennaSway 2.0s ease-in-out infinite 1.0s;
+  }}
+  /* ── Neural glow pulse ──────────────────── */
+  @keyframes pulseGlow {{
+    0%   {{ opacity: 0.3; transform: scale(1.0); }}
+    50%  {{ opacity: 0.85; transform: scale(1.08); }}
+    100% {{ opacity: 0.3; transform: scale(1.0); }}
+  }}
+  .neural-halo {{
+    transform-origin: 200px 224px;
+    animation: pulseGlow var(--glow-pulse-duration) ease-in-out infinite;
+    visibility: {glow_visible};
   }}
 </style>
 
 <svg class="fly-svg" xmlns="http://www.w3.org/2000/svg"
-     viewBox="0 0 300 420" width="300" height="420"
+     viewBox="0 0 400 520" width="400" height="520"
      role="img" aria-label="Animated fruit fly avatar">
 
   <defs>
@@ -132,152 +175,152 @@ def to_html(fci: float, event: str) -> str:
       <circle cx="3" cy="3" r="2.2" fill="#CC0000" stroke="#990000"
               stroke-width="0.4"/>
     </pattern>
+    <!-- Neural glow filter -->
+    <filter id="neuralGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="8" result="blur"/>
+      <feColorMatrix type="matrix"
+        values="0 0 0 0 0
+                0 1 0 0 0.5
+                0 0 0 0 0.3
+                0 0 0 1 0" result="glow"/>
+      <feMerge>
+        <feMergeNode in="glow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
   </defs>
 
   <g class="fly-body-group">
 
+    <!-- ════════ NEURAL GLOW HALO (behind body) ════════ -->
+    <ellipse class="neural-halo" cx="200" cy="224" rx="55" ry="45"
+             fill="{glow_color}" filter="url(#neuralGlow)"
+             opacity="{glow_intensity:.2f}"/>
+
     <!-- ════════ ANTENNAE ════════ -->
     <g class="antenna-left">
-      <!-- Left antenna: 2 segments + arista -->
-      <line x1="140" y1="100" x2="125" y2="72" stroke="#5C4033"
+      <line x1="187" y1="133" x2="167" y2="96" stroke="#5C4033"
+            stroke-width="3" stroke-linecap="round"/>
+      <line x1="167" y1="96" x2="153" y2="67" stroke="#5C4033"
             stroke-width="2.5" stroke-linecap="round"/>
-      <line x1="125" y1="72" x2="115" y2="50" stroke="#5C4033"
-            stroke-width="2" stroke-linecap="round"/>
-      <!-- Arista (feathery branch) -->
-      <line x1="120" y1="60" x2="105" y2="45" stroke="#5C4033"
-            stroke-width="1" stroke-linecap="round" opacity="0.7"/>
-      <line x1="118" y1="55" x2="100" y2="48" stroke="#5C4033"
-            stroke-width="0.8" stroke-linecap="round" opacity="0.5"/>
+      <line x1="160" y1="80" x2="140" y2="60" stroke="#5C4033"
+            stroke-width="1.2" stroke-linecap="round" opacity="0.7"/>
+      <line x1="157" y1="73" x2="133" y2="64" stroke="#5C4033"
+            stroke-width="1" stroke-linecap="round" opacity="0.5"/>
     </g>
     <g class="antenna-right">
-      <!-- Right antenna: 2 segments + arista -->
-      <line x1="160" y1="100" x2="175" y2="72" stroke="#5C4033"
+      <line x1="213" y1="133" x2="233" y2="96" stroke="#5C4033"
+            stroke-width="3" stroke-linecap="round"/>
+      <line x1="233" y1="96" x2="247" y2="67" stroke="#5C4033"
             stroke-width="2.5" stroke-linecap="round"/>
-      <line x1="175" y1="72" x2="185" y2="50" stroke="#5C4033"
-            stroke-width="2" stroke-linecap="round"/>
-      <line x1="180" y1="60" x2="195" y2="45" stroke="#5C4033"
-            stroke-width="1" stroke-linecap="round" opacity="0.7"/>
-      <line x1="182" y1="55" x2="200" y2="48" stroke="#5C4033"
-            stroke-width="0.8" stroke-linecap="round" opacity="0.5"/>
+      <line x1="240" y1="80" x2="260" y2="60" stroke="#5C4033"
+            stroke-width="1.2" stroke-linecap="round" opacity="0.7"/>
+      <line x1="243" y1="73" x2="267" y2="64" stroke="#5C4033"
+            stroke-width="1" stroke-linecap="round" opacity="0.5"/>
     </g>
 
     <!-- ════════ HEAD ════════ -->
-    <ellipse cx="150" cy="105" rx="32" ry="28" fill="#5C4033"/>
+    <ellipse cx="200" cy="140" rx="43" ry="37" fill="#5C4033"/>
     <!-- Compound eyes -->
-    <ellipse cx="128" cy="100" rx="14" ry="16" fill="url(#facets)"
+    <ellipse cx="171" cy="133" rx="19" ry="21" fill="url(#facets)"
              stroke="#990000" stroke-width="1"/>
-    <ellipse cx="172" cy="100" rx="14" ry="16" fill="url(#facets)"
+    <ellipse cx="229" cy="133" rx="19" ry="21" fill="url(#facets)"
              stroke="#990000" stroke-width="1"/>
     <!-- Eye shine highlights -->
-    <ellipse cx="124" cy="95" rx="4" ry="5" fill="rgba(255,255,255,0.15)"/>
-    <ellipse cx="168" cy="95" rx="4" ry="5" fill="rgba(255,255,255,0.15)"/>
+    <ellipse cx="165" cy="127" rx="5" ry="7" fill="rgba(255,255,255,0.15)"/>
+    <ellipse cx="224" cy="127" rx="5" ry="7" fill="rgba(255,255,255,0.15)"/>
     <!-- Proboscis -->
-    <line x1="150" y1="125" x2="150" y2="140" stroke="#5C4033"
-          stroke-width="2" stroke-linecap="round"/>
+    <line x1="200" y1="167" x2="200" y2="187" stroke="#5C4033"
+          stroke-width="2.5" stroke-linecap="round"/>
 
     <!-- ════════ THORAX ════════ -->
-    <ellipse cx="150" cy="168" rx="35" ry="30" fill="#5C4033"/>
-    <!-- Thorax texture lines -->
-    <ellipse cx="150" cy="168" rx="28" ry="24" fill="none"
-             stroke="#4A3328" stroke-width="0.8" opacity="0.5"/>
+    <ellipse cx="200" cy="224" rx="47" ry="40" fill="#5C4033"/>
+    <ellipse cx="200" cy="224" rx="37" ry="32" fill="none"
+             stroke="#4A3328" stroke-width="1" opacity="0.5"/>
     <!-- Scutellum -->
-    <ellipse cx="150" cy="148" rx="18" ry="8" fill="#6B4226" opacity="0.6"/>
+    <ellipse cx="200" cy="197" rx="24" ry="11" fill="#6B4226" opacity="0.6"/>
 
     <!-- ════════ WINGS ════════ -->
     <g class="wing-left">
-      <ellipse cx="90" cy="140" rx="55" ry="20" fill="url(#wingGrad)"
-               stroke="rgba(180,220,255,0.5)" stroke-width="0.8"/>
-      <!-- Wing veins -->
-      <line x1="145" y1="155" x2="50" y2="135" stroke="rgba(150,190,230,0.4)"
+      <ellipse cx="120" cy="187" rx="73" ry="27" fill="url(#wingGrad)"
+               stroke="rgba(180,220,255,0.5)" stroke-width="1"/>
+      <line x1="193" y1="207" x2="67" y2="180" stroke="rgba(150,190,230,0.4)"
+            stroke-width="0.9"/>
+      <line x1="187" y1="211" x2="80" y2="197" stroke="rgba(150,190,230,0.3)"
             stroke-width="0.7"/>
-      <line x1="140" y1="158" x2="60" y2="148" stroke="rgba(150,190,230,0.3)"
-            stroke-width="0.5"/>
-      <line x1="135" y1="160" x2="70" y2="155" stroke="rgba(150,190,230,0.25)"
-            stroke-width="0.5"/>
-      <!-- Cross vein -->
-      <line x1="95" y1="133" x2="90" y2="148" stroke="rgba(150,190,230,0.3)"
-            stroke-width="0.5"/>
+      <line x1="180" y1="213" x2="93" y2="207" stroke="rgba(150,190,230,0.25)"
+            stroke-width="0.7"/>
+      <line x1="127" y1="177" x2="120" y2="197" stroke="rgba(150,190,230,0.3)"
+            stroke-width="0.7"/>
     </g>
     <g class="wing-right">
-      <ellipse cx="210" cy="140" rx="55" ry="20" fill="url(#wingGrad)"
-               stroke="rgba(180,220,255,0.5)" stroke-width="0.8"/>
-      <line x1="155" y1="155" x2="250" y2="135" stroke="rgba(150,190,230,0.4)"
+      <ellipse cx="280" cy="187" rx="73" ry="27" fill="url(#wingGrad)"
+               stroke="rgba(180,220,255,0.5)" stroke-width="1"/>
+      <line x1="207" y1="207" x2="333" y2="180" stroke="rgba(150,190,230,0.4)"
+            stroke-width="0.9"/>
+      <line x1="213" y1="211" x2="320" y2="197" stroke="rgba(150,190,230,0.3)"
             stroke-width="0.7"/>
-      <line x1="160" y1="158" x2="240" y2="148" stroke="rgba(150,190,230,0.3)"
-            stroke-width="0.5"/>
-      <line x1="165" y1="160" x2="230" y2="155" stroke="rgba(150,190,230,0.25)"
-            stroke-width="0.5"/>
-      <line x1="205" y1="133" x2="210" y2="148" stroke="rgba(150,190,230,0.3)"
-            stroke-width="0.5"/>
+      <line x1="220" y1="213" x2="307" y2="207" stroke="rgba(150,190,230,0.25)"
+            stroke-width="0.7"/>
+      <line x1="273" y1="177" x2="280" y2="197" stroke="rgba(150,190,230,0.3)"
+            stroke-width="0.7"/>
     </g>
 
     <!-- ════════ ABDOMEN ════════ -->
-    <!-- Segment 1 -->
-    <ellipse cx="150" cy="210" rx="30" ry="18" fill="{stripe_color}"/>
-    <ellipse cx="150" cy="210" rx="30" ry="18" fill="none"
-             stroke="#4A3328" stroke-width="0.8"/>
-    <!-- Segment 2 -->
-    <ellipse cx="150" cy="240" rx="26" ry="16" fill="#5C4033"/>
-    <ellipse cx="150" cy="240" rx="26" ry="16" fill="none"
-             stroke="#4A3328" stroke-width="0.8"/>
-    <!-- Segment 3 -->
-    <ellipse cx="150" cy="268" rx="22" ry="14" fill="{stripe_color}"/>
-    <ellipse cx="150" cy="268" rx="22" ry="14" fill="none"
-             stroke="#4A3328" stroke-width="0.8"/>
-    <!-- Segment 4 (tapered tip) -->
-    <ellipse cx="150" cy="292" rx="16" ry="12" fill="#5C4033"/>
-    <ellipse cx="150" cy="292" rx="16" ry="12" fill="none"
-             stroke="#4A3328" stroke-width="0.8"/>
-    <!-- Abdomen tip -->
-    <ellipse cx="150" cy="310" rx="8" ry="8" fill="#4A3328"/>
+    <ellipse cx="200" cy="280" rx="40" ry="24" fill="{stripe_color}"/>
+    <ellipse cx="200" cy="280" rx="40" ry="24" fill="none"
+             stroke="#4A3328" stroke-width="1"/>
+    <ellipse cx="200" cy="320" rx="35" ry="21" fill="#5C4033"/>
+    <ellipse cx="200" cy="320" rx="35" ry="21" fill="none"
+             stroke="#4A3328" stroke-width="1"/>
+    <ellipse cx="200" cy="357" rx="29" ry="19" fill="{stripe_color}"/>
+    <ellipse cx="200" cy="357" rx="29" ry="19" fill="none"
+             stroke="#4A3328" stroke-width="1"/>
+    <ellipse cx="200" cy="389" rx="21" ry="16" fill="#5C4033"/>
+    <ellipse cx="200" cy="389" rx="21" ry="16" fill="none"
+             stroke="#4A3328" stroke-width="1"/>
+    <ellipse cx="200" cy="413" rx="11" ry="11" fill="#4A3328"/>
 
     <!-- ════════ LEGS (3 pairs) ════════ -->
-    <!-- Fore legs (attached near head-thorax junction) -->
     <g class="legs-left">
-      <!-- Left fore leg: femur → tibia → tarsus -->
-      <line x1="130" y1="155" x2="105" y2="175" stroke="#5C4033"
+      <line x1="173" y1="207" x2="140" y2="233" stroke="#5C4033"
+            stroke-width="3" stroke-linecap="round"/>
+      <line x1="140" y1="233" x2="113" y2="267" stroke="#5C4033"
             stroke-width="2.5" stroke-linecap="round"/>
-      <line x1="105" y1="175" x2="85" y2="200" stroke="#5C4033"
+      <line x1="113" y1="267" x2="100" y2="287" stroke="#5C4033"
             stroke-width="2" stroke-linecap="round"/>
-      <line x1="85" y1="200" x2="75" y2="215" stroke="#5C4033"
-            stroke-width="1.5" stroke-linecap="round"/>
-      <!-- Left mid leg -->
-      <line x1="125" y1="175" x2="95" y2="205" stroke="#5C4033"
+      <line x1="167" y1="233" x2="127" y2="273" stroke="#5C4033"
+            stroke-width="3" stroke-linecap="round"/>
+      <line x1="127" y1="273" x2="100" y2="313" stroke="#5C4033"
             stroke-width="2.5" stroke-linecap="round"/>
-      <line x1="95" y1="205" x2="75" y2="235" stroke="#5C4033"
+      <line x1="100" y1="313" x2="87" y2="336" stroke="#5C4033"
             stroke-width="2" stroke-linecap="round"/>
-      <line x1="75" y1="235" x2="65" y2="252" stroke="#5C4033"
-            stroke-width="1.5" stroke-linecap="round"/>
-      <!-- Left hind leg -->
-      <line x1="128" y1="195" x2="100" y2="240" stroke="#5C4033"
+      <line x1="171" y1="260" x2="133" y2="320" stroke="#5C4033"
+            stroke-width="3" stroke-linecap="round"/>
+      <line x1="133" y1="320" x2="109" y2="373" stroke="#5C4033"
             stroke-width="2.5" stroke-linecap="round"/>
-      <line x1="100" y1="240" x2="82" y2="280" stroke="#5C4033"
+      <line x1="109" y1="373" x2="96" y2="400" stroke="#5C4033"
             stroke-width="2" stroke-linecap="round"/>
-      <line x1="82" y1="280" x2="72" y2="300" stroke="#5C4033"
-            stroke-width="1.5" stroke-linecap="round"/>
     </g>
     <g class="legs-right">
-      <!-- Right fore leg -->
-      <line x1="170" y1="155" x2="195" y2="175" stroke="#5C4033"
+      <line x1="227" y1="207" x2="260" y2="233" stroke="#5C4033"
+            stroke-width="3" stroke-linecap="round"/>
+      <line x1="260" y1="233" x2="287" y2="267" stroke="#5C4033"
             stroke-width="2.5" stroke-linecap="round"/>
-      <line x1="195" y1="175" x2="215" y2="200" stroke="#5C4033"
+      <line x1="287" y1="267" x2="300" y2="287" stroke="#5C4033"
             stroke-width="2" stroke-linecap="round"/>
-      <line x1="215" y1="200" x2="225" y2="215" stroke="#5C4033"
-            stroke-width="1.5" stroke-linecap="round"/>
-      <!-- Right mid leg -->
-      <line x1="175" y1="175" x2="205" y2="205" stroke="#5C4033"
+      <line x1="233" y1="233" x2="273" y2="273" stroke="#5C4033"
+            stroke-width="3" stroke-linecap="round"/>
+      <line x1="273" y1="273" x2="300" y2="313" stroke="#5C4033"
             stroke-width="2.5" stroke-linecap="round"/>
-      <line x1="205" y1="205" x2="225" y2="235" stroke="#5C4033"
+      <line x1="300" y1="313" x2="313" y2="336" stroke="#5C4033"
             stroke-width="2" stroke-linecap="round"/>
-      <line x1="225" y1="235" x2="235" y2="252" stroke="#5C4033"
-            stroke-width="1.5" stroke-linecap="round"/>
-      <!-- Right hind leg -->
-      <line x1="172" y1="195" x2="200" y2="240" stroke="#5C4033"
+      <line x1="229" y1="260" x2="267" y2="320" stroke="#5C4033"
+            stroke-width="3" stroke-linecap="round"/>
+      <line x1="267" y1="320" x2="291" y2="373" stroke="#5C4033"
             stroke-width="2.5" stroke-linecap="round"/>
-      <line x1="200" y1="240" x2="218" y2="280" stroke="#5C4033"
+      <line x1="291" y1="373" x2="304" y2="400" stroke="#5C4033"
             stroke-width="2" stroke-linecap="round"/>
-      <line x1="218" y1="280" x2="228" y2="300" stroke="#5C4033"
-            stroke-width="1.5" stroke-linecap="round"/>
     </g>
 
   </g><!-- /fly-body-group -->
@@ -285,9 +328,41 @@ def to_html(fci: float, event: str) -> str:
 
 <script>
 function updateAvatar(fci) {{
-  // Map FCI to wing-beat duration: high FCI → fast (0.06s), low → sluggish (0.8s)
   var duration = 0.8 - fci * 0.74;
   document.documentElement.style.setProperty('--wing-beat-duration', duration.toFixed(3) + 's');
+}}
+
+var _smoothedActivity = 0.0;
+var _lastActivityTime = Date.now();
+
+function updateAvatarActivity(activity) {{
+  // Exponential smoothing: smoothed += (target - smoothed) * (1 - exp(-dt/tau))
+  var now = Date.now();
+  var dt = (now - _lastActivityTime) / 1000.0;
+  _lastActivityTime = now;
+  var tau = 0.5;
+  var alpha = 1.0 - Math.exp(-dt / tau);
+  _smoothedActivity += (activity - _smoothedActivity) * alpha;
+  var a = Math.min(Math.max(_smoothedActivity, 0.0), 1.0);
+
+  // Map to glow intensity and pulse duration
+  var intensity = 0.2 + a * 0.7;
+  var pulseDur = 3.0 - a * 2.6;
+  document.documentElement.style.setProperty('--glow-intensity', intensity.toFixed(2));
+  document.documentElement.style.setProperty('--glow-pulse-duration', pulseDur.toFixed(2) + 's');
+
+  // Update halo visibility and opacity
+  var halo = document.querySelector('.neural-halo');
+  if (halo) {{
+    halo.style.visibility = a > 0.01 ? 'visible' : 'hidden';
+    halo.setAttribute('opacity', intensity.toFixed(2));
+    // Update color: green → amber at high activity
+    if (a > 0.7) {{
+      halo.setAttribute('fill', 'rgba(255,204,0,' + intensity.toFixed(2) + ')');
+    }} else {{
+      halo.setAttribute('fill', 'rgba(0,255,136,' + intensity.toFixed(2) + ')');
+    }}
+  }}
 }}
 </script>
 """
