@@ -1,376 +1,300 @@
-"""Calibrate LIF parameters from rate-model activations.
+"""Calibrate LIF spiking parameters from rate-model activations.
 
-Runs the rate-based reservoir on sampled economy states, records per-neuron
-mean absolute activations (tanh output), then grid-searches LIF parameters
-(gain, mbon_hold_frac) to produce proportional firing rates on the
-mushroom-body subcircuit.
+Grid-searches gain and MBON tonic hold to match LIF firing rates
+to rate-model activation magnitudes (Pearson r per neuron type).
 
-Usage::
-
-    python -m flyecon.calibrate_from_rate [--cache-dir cache/connectome/]
+Usage: python -m flyecon.calibrate_from_rate
 """
-
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import structlog
 import torch
-from scipy import sparse
 
 from flyecon.etl.loader import Connectome, load_connectome
 from flyecon.etl.subcircuit import extract_mushroom_body
-from flyecon.sim.lif import LIFNetwork
-from flyecon.state.constants import (
-    DT_MS,
-    MAX_LOSS_STREAK,
-    MAX_MONEY,
-    MIN_MONEY,
-    MONEY_STEP,
-    ROUNDS_PER_HALF,
-    TAU_MS,
-    V_REST_MV,
-    V_THRESH_MV,
-)
-from flyecon.state.economy import EconomyState
+from flyecon.policy.imitation import df_to_states, load_pro_rounds
+from flyecon.reservoir import build_reservoir
+from flyecon.sim.lif import C_M, LIFNetwork, _ONE_MINUS_DECAY
+from flyecon.state.constants import TAU_MS, V_REST_MV, V_THRESH_MV
 
 log = structlog.get_logger()
 
-GAIN_VALUES: list[float] = [0.5, 1.0, 2.0, 5.0]
-MBON_HOLD_VALUES: list[float] = [0.3, 0.5, 0.7, 0.85]
-_TYPE_PREFIXES: dict[str, str] = {"KC": "KC", "MBON": "MBON", "PPL": "PPL"}
-
-
-@dataclass
-class GroupStats:
-    """Per-group rate-model activation statistics."""
-
-    group: str
-    count: int
-    mean_abs_activation: float
-    std_abs_activation: float
-
-
-@dataclass
-class GridSearchEntry:
-    """One row in the grid search result table."""
-
-    gain: float
-    mbon_hold_frac: float
-    correlation: float
-    mean_lif_rate_hz: float
-
+N_CALIBRATION_STATES: int = 200
+DURATION_MS: float = 400.0
+GAIN_GRID: list[float] = [0.5, 1.0, 2.0, 5.0, 10.0]
+MBON_HOLD_GRID: list[float] = [0.0, 0.3, 0.5, 0.7, 0.85]
+_NEURON_GROUPS = ("KC", "MBON", "PPL")
 
 @dataclass
 class CalibrationFromRateResult:
-    """Full output of ``calibrate_from_rate``."""
-
-    group_stats: list[GroupStats]
-    grid_results: list[GridSearchEntry]
+    """Output of the rate-to-LIF calibration sweep."""
     best_gain: float
-    best_mbon_hold_frac: float
+    best_mbon_hold: float
     best_correlation: float
-    n_economy_states: int
-    n_subcircuit_neurons: int
+    per_type_correlation: dict[str, float]
+    grid_results: list[dict[str, float]] = field(default_factory=list)
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────
+def _classify_neuron(ntype: str) -> str:
+    """Map a neuron-type label to KC / MBON / PPL / Other."""
+    for prefix in _NEURON_GROUPS:
+        if ntype.startswith(prefix):
+            return prefix
+    return "Other"
 
 
-def _sample_economy_states(n: int = 100, seed: int = 42) -> list[EconomyState]:
-    """Generate *n* diverse economy states by uniform random sampling."""
-    rng = np.random.default_rng(seed)
-    states: list[EconomyState] = []
-    for _ in range(n):
-        money = int(rng.integers(MIN_MONEY, MAX_MONEY + 1))
-        money = max(MIN_MONEY, min((money // MONEY_STEP) * MONEY_STEP, MAX_MONEY))
-        states.append(EconomyState(
-            money=money,
-            loss_streak=int(rng.integers(0, MAX_LOSS_STREAK + 1)),
-            round_number=int(rng.integers(1, ROUNDS_PER_HALF + 1)),
-            half=int(rng.integers(0, 2)),
-            opponent_loss_streak=int(rng.integers(0, MAX_LOSS_STREAK + 1)),
-        ))
-    return states
-
-
-def _collect_rate_activations(
-    connectome: Connectome,
-    states: list[EconomyState],
-    device: str = "cpu",
-) -> torch.Tensor:
-    """Run the rate-model reservoir on each state; return mean |activation|."""
-    from flyecon.reservoir import FlyReservoir
-
-    W_torch = connectome.weight_matrix
-    crow = W_torch.crow_indices().numpy()
-    col = W_torch.col_indices().numpy()
-    vals = W_torch.values().numpy().copy()
-    n = W_torch.shape[0]
-    W_scipy = sparse.csr_matrix((vals, col, crow), shape=(n, n))
-
-    # Fan-in normalization (mirrors reservoir.py _build_weight_matrix)
-    abs_row_sums = np.maximum(
-        np.array(np.abs(W_scipy).sum(axis=1)).flatten(), 1.0,
-    )
-    W_norm = (
-        sparse.diags(1.0 / abs_row_sums, format="csr") @ W_scipy
-    ).astype(np.float32)
-
-    reservoir = FlyReservoir(n, W_norm, device=device)
-    abs_sum = torch.zeros(n, dtype=torch.float32, device=device)
-    for state in states:
-        reservoir.reset()
-        for _ in range(3):  # 3 recurrence steps (same as reservoir.forward)
-            reservoir.step(state)
-        abs_sum += reservoir.state.abs()
-    return (abs_sum / len(states)).cpu()
-
-
-def _classify_neurons(connectome: Connectome) -> dict[str, list[int]]:
-    """Group dense indices by neuron type prefix (KC/MBON/PPL/Other)."""
-    groups: dict[str, list[int]] = {g: [] for g in _TYPE_PREFIXES}
-    groups["Other"] = []
-    for idx in range(connectome.n_neurons):
-        ntype = connectome.neuron_types.get(int(connectome.body_ids[idx]), "")
-        matched = False
-        for gname, prefix in _TYPE_PREFIXES.items():
-            if ntype.startswith(prefix):
-                groups[gname].append(idx)
-                matched = True
-                break
-        if not matched:
-            groups["Other"].append(idx)
-    return groups
-
-
-def _compute_group_stats(
-    activations: torch.Tensor,
-    groups: dict[str, list[int]],
-) -> list[GroupStats]:
-    """Compute per-group activation mean and std."""
-    stats: list[GroupStats] = []
-    for name, indices in groups.items():
-        if not indices:
-            stats.append(GroupStats(name, 0, 0.0, 0.0))
-            continue
-        g = activations[torch.tensor(indices, dtype=torch.long)]
-        stats.append(GroupStats(
-            name,
-            len(indices),
-            float(g.mean().item()),
-            float(g.std().item()) if len(indices) > 1 else 0.0,
-        ))
-    return stats
-
-
-def _build_lif_with_hold(
-    connectome: Connectome,
-    gain: float,
-    mbon_hold_frac: float,
-    device: str = "cpu",
-) -> LIFNetwork:
-    """Build a LIFNetwork with a custom *mbon_hold_frac*."""
-    net = LIFNetwork(connectome, gain=gain, device=device)
-    decay = math.exp(-DT_MS / TAU_MS)
-    net._tonic_current.zero_()
-    if len(net._mbon_indices) > 0:
-        tonic_mv = mbon_hold_frac * (V_THRESH_MV - V_REST_MV) / (1.0 - decay)
-        net._tonic_current[net._mbon_idx_t] = tonic_mv
-    return net
-
-
-def _encode_economy_state(state: EconomyState) -> np.ndarray:
-    """Encode economy state to 6-d vector (same as reservoir._encode_state)."""
-    return np.array([
-        state.money / 16000.0,
-        state.round_number / 12.0,
-        state.half,
-        state.loss_streak / 4.0,
-        state.opponent_loss_streak / 4.0,
-        1.0,
-    ], dtype=np.float32)
-
-
-def _run_lif_on_states(
-    connectome: Connectome,
-    states: list[EconomyState],
-    gain: float,
-    mbon_hold_frac: float,
-    duration_ms: float = 500.0,
-    device: str = "cpu",
-) -> torch.Tensor:
-    """Run LIF per economy state; return mean firing rate (Hz) per neuron."""
+def _build_type_masks(connectome: Connectome) -> dict[str, np.ndarray]:
+    """Return boolean masks for each neuron-type group."""
     n = connectome.n_neurons
-    rng = np.random.default_rng(42)
-    input_bins = rng.integers(0, 6, n)
-    input_sign = rng.choice([-1.0, 1.0], n).astype(np.float32)
-    rate_sum = torch.zeros(n, dtype=torch.float32)
-    duration_s = duration_ms / 1000.0
-
-    for state in states:
-        encoded = _encode_economy_state(state)
-        # Same random projection as reservoir; scale to LIF mV range
-        inp = torch.tensor(
-            encoded[input_bins] * input_sign * 10.0,
-            dtype=torch.float32,
-        )
-        net = _build_lif_with_hold(connectome, gain, mbon_hold_frac, device)
-        counts = net.simulate(inp.to(device), duration_ms, jitter=True)
-        rate_sum += counts.cpu() / duration_s
-    return rate_sum / len(states)
+    masks: dict[str, list[bool]] = {g: [False] * n for g in (*_NEURON_GROUPS, "Other")}
+    for idx in range(n):
+        body_id = int(connectome.body_ids[idx])
+        ntype = connectome.neuron_types.get(body_id, "")
+        masks[_classify_neuron(ntype)][idx] = True
+    return {k: np.array(v) for k, v in masks.items()}
 
 
-def _pearson_correlation(x: torch.Tensor, y: torch.Tensor) -> float:
-    """Pearson r between two 1-D tensors. Returns 0.0 on zero variance."""
-    xc = (x - x.mean()).float()
-    yc = (y - y.mean()).float()
-    denom = torch.sqrt((xc**2).sum() * (yc**2).sum())
-    if denom.item() < 1e-12:
+def _pearson_correlation(x: np.ndarray, y: np.ndarray) -> float:
+    """Pearson r between *x* and *y*.  Returns 0.0 if degenerate."""
+    if len(x) < 2:
         return 0.0
-    return float(((xc * yc).sum() / denom).item())
+    xd, yd = x - x.mean(), y - y.mean()
+    denom = np.sqrt((xd ** 2).sum() * (yd ** 2).sum())
+    return float((xd * yd).sum() / denom) if denom > 1e-12 else 0.0
 
 
-def _map_full_to_sub(full: Connectome, sub: Connectome) -> np.ndarray:
-    """Return array[sub.n_neurons] of full dense indices (-1 if missing)."""
-    idx = np.searchsorted(full.body_ids, sub.body_ids)
-    valid = (idx < len(full.body_ids)) & (full.body_ids[idx] == sub.body_ids)
-    return np.where(valid, idx, -1).astype(np.int64)
+def collect_rate_activations(
+    states: list, cache_dir: str = "cache/connectome/",
+) -> tuple[np.ndarray, Connectome]:
+    """Run rate model on *states*, return mean |activation| per neuron."""
+    reservoir = build_reservoir(cache_dir=cache_dir, device="cpu")
+    conn_full = load_connectome(cache_dir)
+    n = reservoir.n
+    all_acts = np.zeros(n, dtype=np.float64)
+    for s in states:
+        reservoir.reset()
+        for _ in range(3):  # 3 recurrence steps (same as FlyReservoir.forward)
+            reservoir.step(s)
+        all_acts += np.abs(reservoir.state.detach().cpu().numpy())
+    mean_abs_act = (all_acts / len(states)).astype(np.float32)
+    log.info("rate_activations_collected", n_states=len(states), n_neurons=n,
+             mean_act=round(float(np.mean(mean_abs_act)), 6))
+    return mean_abs_act, conn_full
 
 
-# ── Main calibration ──────────────────────────────────────────────────────
+def _map_activations_to_subcircuit(
+    full_activations: np.ndarray, full_conn: Connectome, mb_conn: Connectome,
+) -> np.ndarray:
+    """Map full-connectome activations to MB subcircuit by body_id."""
+    full_bid_to_idx = {int(bid): i for i, bid in enumerate(full_conn.body_ids)}
+    mb_acts = np.zeros(mb_conn.n_neurons, dtype=np.float32)
+    for j in range(mb_conn.n_neurons):
+        bid = int(mb_conn.body_ids[j])
+        if bid in full_bid_to_idx:
+            mb_acts[j] = full_activations[full_bid_to_idx[bid]]
+    return mb_acts
+
+
+def _simulate_lif_rates(
+    mb_conn: Connectome, states: list, gain: float,
+    mbon_hold_frac: float, duration_ms: float = DURATION_MS,
+) -> np.ndarray:
+    """Simulate LIF on *states*, return mean firing rate (Hz) per neuron."""
+    from flyecon.encoding.population import (
+        N_INPUT_NEURONS, PopulationEncoder, map_to_connectome_inputs,
+    )
+    n = mb_conn.n_neurons
+    lif = LIFNetwork(mb_conn, gain=gain, device="cpu")
+
+    # Override tonic current: mbon_hold_frac * (V_THRESH-V_REST) / (TAU*(1-decay)/C_M)
+    lif._tonic_current.zero_()
+    if len(lif._mbon_indices) > 0 and mbon_hold_frac > 0:
+        tonic_mv = mbon_hold_frac * (V_THRESH_MV - V_REST_MV) / (
+            TAU_MS * _ONE_MINUS_DECAY / C_M
+        )
+        lif._tonic_current[lif._mbon_idx_t] = tonic_mv
+
+    encoder = PopulationEncoder()
+    # Use KC neurons as input layer (same logic as build_fly_policy)
+    kc_ids = [
+        idx for idx in range(n)
+        if mb_conn.neuron_types.get(int(mb_conn.body_ids[idx]), "").startswith("KC")
+    ]
+    if len(kc_ids) >= N_INPUT_NEURONS:
+        import random as _rng
+        _rng.seed(42)
+        _rng.shuffle(kc_ids)
+        input_ids = kc_ids
+    else:
+        input_ids = list(range(min(N_INPUT_NEURONS, n)))
+
+    total_counts = np.zeros(n, dtype=np.float64)
+    duration_s = duration_ms / 1000.0
+    for s in states:
+        encoded = encoder.encode(s).unsqueeze(0)
+        n_in = len(input_ids)
+        if n_in < encoded.shape[-1]:
+            encoded = encoded[:, :n_in]
+        full_input = map_to_connectome_inputs(encoded, input_ids, n).squeeze(0)
+        counts = lif.simulate(full_input, duration_ms, jitter=True)
+        total_counts += counts.numpy()
+    return (total_counts / (len(states) * duration_s)).astype(np.float32)
 
 
 def calibrate_from_rate(
     cache_dir: str = "cache/connectome/",
-    n_states: int = 100,
-    duration_ms: float = 500.0,
-    gain_values: list[float] | None = None,
-    mbon_hold_values: list[float] | None = None,
-    max_subcircuit_neurons: int = 5000,
-    device: str = "cpu",
+    train_path: str = "data/cs2_pro_train.parquet",
+    n_states: int = N_CALIBRATION_STATES,
 ) -> CalibrationFromRateResult:
-    """Run full calibration: rate-model activations -> LIF parameter search.
+    """Run the full rate-to-LIF calibration pipeline and return best params."""
+    # 1. Load 200 economy states from training data
+    log.info("calibration.loading_states", path=train_path, n=n_states)
+    df = load_pro_rounds(train_path)
+    df_sample = df.sample(n=min(n_states, len(df)), random_state=42)
+    states = df_to_states(df_sample)
 
-    1. Load full connectome, run rate model on *n_states* economy states.
-    2. Extract mushroom-body subcircuit, group neurons by type.
-    3. Grid search (gain x mbon_hold_frac), measuring Pearson r between
-       rate-model |activation| and LIF firing rate per neuron.
-    4. Return best parameters and the correlation achieved.
-    """
-    gains = gain_values or GAIN_VALUES
-    holds = mbon_hold_values or MBON_HOLD_VALUES
+    # 2. Collect rate-model activations
+    full_activations, full_conn = collect_rate_activations(states, cache_dir)
 
-    # 1. Load connectome
-    log.info("calibrate.loading_connectome", cache_dir=cache_dir)
-    full_conn = load_connectome(cache_dir)
-    log.info("calibrate.connectome_loaded", n=full_conn.n_neurons)
+    # 3. Extract mushroom body and map activations
+    mb_conn = extract_mushroom_body(full_conn, max_neurons=5000)
+    type_masks = _build_type_masks(mb_conn)
+    mb_activations = _map_activations_to_subcircuit(full_activations, full_conn, mb_conn)
+    log.info("calibration.mb_activations", n_mb=mb_conn.n_neurons,
+             kc_mean=round(float(np.mean(mb_activations[type_masks["KC"]])), 4),
+             mbon_mean=round(float(np.mean(mb_activations[type_masks["MBON"]])), 4),
+             ppl_mean=round(float(np.mean(mb_activations[type_masks["PPL"]])), 4))
 
-    # 2. Sample states & run rate model
-    states = _sample_economy_states(n_states)
-    log.info("calibrate.running_rate_model", n_states=len(states))
-    full_act = _collect_rate_activations(full_conn, states, device)
-    log.info(
-        "calibrate.rate_model_done",
-        mean=float(full_act.mean()),
-        max=float(full_act.max()),
-    )
+    # 4. Grid search over gain x mbon_hold_frac
+    log.info("calibration.grid_search", gains=GAIN_GRID, holds=MBON_HOLD_GRID)
+    best_corr, best_gain, best_hold = -1.0, GAIN_GRID[0], MBON_HOLD_GRID[0]
+    best_per_type: dict[str, float] = {}
+    grid_results: list[dict[str, float]] = []
 
-    # 3. Group stats on full connectome
-    full_groups = _classify_neurons(full_conn)
-    group_stats = _compute_group_stats(full_act, full_groups)
-    for gs in group_stats:
-        log.info(
-            "calibrate.group",
-            group=gs.group,
-            n=gs.count,
-            mean=round(gs.mean_abs_activation, 6),
-        )
+    for gain in GAIN_GRID:
+        for mbon_hold in MBON_HOLD_GRID:
+            log.info("calibration.trial", gain=gain, mbon_hold=mbon_hold)
+            lif_rates = _simulate_lif_rates(mb_conn, states, gain, mbon_hold)
 
-    # 4. Extract mushroom-body subcircuit
-    sub_conn = extract_mushroom_body(
-        full_conn, hops=1, max_neurons=max_subcircuit_neurons,
-    )
-    log.info("calibrate.subcircuit", n=sub_conn.n_neurons)
+            per_type_corr: dict[str, float] = {}
+            for group in _NEURON_GROUPS:
+                mask = type_masks[group]
+                if mask.sum() < 2:
+                    per_type_corr[group] = 0.0
+                    continue
+                per_type_corr[group] = _pearson_correlation(
+                    mb_activations[mask], lif_rates[mask])
 
-    sub_to_full = _map_full_to_sub(full_conn, sub_conn)
-    valid_mask = sub_to_full >= 0
-    sub_act = full_act[sub_to_full[valid_mask]]
+            overall_corr = _pearson_correlation(mb_activations, lif_rates)
+            typed_mean = float(np.mean([per_type_corr[g] for g in _NEURON_GROUPS]))
 
-    # 5. Grid search
-    grid_results: list[GridSearchEntry] = []
-    best_corr, best_gain, best_hold = -2.0, gains[0], holds[0]
+            grid_results.append({
+                "gain": gain, "mbon_hold": mbon_hold,
+                "overall_corr": overall_corr, "typed_mean_corr": typed_mean,
+                "kc_corr": per_type_corr["KC"], "mbon_corr": per_type_corr["MBON"],
+                "ppl_corr": per_type_corr["PPL"],
+                "mean_rate_hz": float(np.mean(lif_rates)),
+                "kc_rate_hz": float(np.mean(lif_rates[type_masks["KC"]])),
+                "mbon_rate_hz": float(np.mean(lif_rates[type_masks["MBON"]])),
+                "ppl_rate_hz": float(np.mean(lif_rates[type_masks["PPL"]])),
+            })
+            log.info("calibration.trial_result", gain=gain, mbon_hold=mbon_hold,
+                     overall=round(overall_corr, 4), typed=round(typed_mean, 4),
+                     rate_hz=round(float(np.mean(lif_rates)), 2))
 
-    for gain in gains:
-        for hold in holds:
-            log.info("calibrate.grid", gain=gain, hold=hold)
-            lif_rates = _run_lif_on_states(
-                sub_conn, states, gain, hold, duration_ms, device,
-            )
-            lif_sub = lif_rates[torch.tensor(valid_mask)]
-            corr = _pearson_correlation(sub_act, lif_sub)
-            entry = GridSearchEntry(gain, hold, corr, float(lif_rates.mean()))
-            grid_results.append(entry)
-            log.info("calibrate.result", gain=gain, hold=hold, corr=round(corr, 4))
-            if corr > best_corr:
-                best_corr, best_gain, best_hold = corr, gain, hold
+            if typed_mean > best_corr:
+                best_corr = typed_mean
+                best_gain, best_hold = gain, mbon_hold
+                best_per_type = dict(per_type_corr)
 
-    log.info(
-        "calibrate.best", gain=best_gain, hold=best_hold, corr=round(best_corr, 4),
-    )
+    log.info("calibration.best", gain=best_gain, hold=best_hold,
+             corr=round(best_corr, 4), per_type=best_per_type)
     return CalibrationFromRateResult(
-        group_stats=group_stats,
-        grid_results=grid_results,
-        best_gain=best_gain,
-        best_mbon_hold_frac=best_hold,
-        best_correlation=best_corr,
-        n_economy_states=n_states,
-        n_subcircuit_neurons=sub_conn.n_neurons,
-    )
+        best_gain=best_gain, best_mbon_hold=best_hold,
+        best_correlation=best_corr, per_type_correlation=best_per_type,
+        grid_results=grid_results)
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────
+def train_readout_at_best(
+    result: CalibrationFromRateResult,
+    cache_dir: str = "cache/connectome/",
+    train_path: str = "data/cs2_pro_train.parquet",
+    eval_path: str = "data/cs2_pro_eval.parquet",
+    n_epochs: int = 10,
+) -> dict[str, float]:
+    """Train imitation-learning readout at best params and return eval accuracy."""
+    from flyecon.policy.imitation import ImitationTrainer
+    from flyecon.policy.ppo import build_fly_policy
+
+    log.info("readout.building_policy", gain=result.best_gain, hold=result.best_mbon_hold)
+    full_conn = load_connectome(cache_dir)
+    mb_conn = extract_mushroom_body(full_conn, max_neurons=5000)
+
+    policy = build_fly_policy(mb_conn, gain=result.best_gain, duration_ms=DURATION_MS)
+    # Override MBON tonic current at best mbon_hold
+    lif = policy._lif
+    lif._tonic_current.zero_()
+    if len(lif._mbon_indices) > 0 and result.best_mbon_hold > 0:
+        tonic_mv = result.best_mbon_hold * (V_THRESH_MV - V_REST_MV) / (
+            TAU_MS * _ONE_MINUS_DECAY / C_M)
+        lif._tonic_current[lif._mbon_idx_t] = tonic_mv
+
+    trainer = ImitationTrainer(policy=policy, train_path=train_path,
+                               eval_path=eval_path, lr=1e-3, batch_size=64)
+    train_metrics: dict[str, float] = {}
+    for epoch in range(n_epochs):
+        train_metrics = trainer.train_epoch()
+        log.info("readout.epoch", epoch=epoch + 1,
+                 loss=round(train_metrics["loss"], 4),
+                 acc=round(train_metrics["accuracy"], 4))
+
+    eval_metrics = trainer.evaluate()
+    log.info("readout.eval", acc=round(eval_metrics["accuracy"], 4),
+             loss=round(eval_metrics["loss"], 4))
+    return {
+        "eval_accuracy": eval_metrics["accuracy"],
+        "eval_loss": eval_metrics["loss"],
+        "train_accuracy": train_metrics.get("accuracy", 0.0),
+    }
 
 
 def main() -> None:
-    """Run calibration from command line."""
-    import argparse
+    """Run the full calibration pipeline and print results."""
+    print("=" * 70)
+    print("Rate -> LIF Calibration")
+    print("=" * 70)
 
-    p = argparse.ArgumentParser(
-        description="Calibrate LIF from rate-model activations",
-    )
-    p.add_argument("--cache-dir", default="cache/connectome/")
-    p.add_argument("--n-states", type=int, default=100)
-    p.add_argument("--duration-ms", type=float, default=500.0)
-    args = p.parse_args()
+    result = calibrate_from_rate()
 
-    result = calibrate_from_rate(args.cache_dir, args.n_states, args.duration_ms)
+    print()
+    print("Best gain:        " + str(result.best_gain))
+    print("Best MBON hold:   " + str(result.best_mbon_hold))
+    print("Best correlation: " + f"{result.best_correlation:.4f}")
+    print("Per-type correlation:")
+    for k, v in result.per_type_correlation.items():
+        print(f"  {k:>6s}: {v:.4f}")
 
-    print("\n" + "=" * 60)
-    print("CALIBRATION RESULTS")
-    print("=" * 60)
-    print(f"\nEconomy states: {result.n_economy_states}")
-    print(f"Subcircuit neurons: {result.n_subcircuit_neurons}")
-    print("\n--- Rate-Model Activation by Neuron Group ---")
-    for gs in result.group_stats:
-        print(
-            f"  {gs.group:6s}: n={gs.count:6d}"
-            f"  mean|act|={gs.mean_abs_activation:.6f}"
-        )
-    print("\n--- Grid Search ---")
-    print(f"{'gain':>6s}  {'hold':>6s}  {'corr':>8s}  {'rate_hz':>10s}")
-    for e in result.grid_results:
-        print(
-            f"{e.gain:6.2f}  {e.mbon_hold_frac:6.2f}"
-            f"  {e.correlation:8.4f}  {e.mean_lif_rate_hz:10.2f}"
-        )
-    print(
-        f"\nBest: gain={result.best_gain}  hold={result.best_mbon_hold_frac}"
-        f"  corr={result.best_correlation:.4f}"
-    )
-    print("=" * 60)
+    hdr = "  gain    hold  overall    typed       KC     MBON      PPL  rate_hz"
+    print()
+    print(hdr)
+    print("-" * len(hdr))
+    for r in result.grid_results:
+        print(f"  {r['gain']:4.1f}    {r['mbon_hold']:4.2f}  "
+              f"{r['overall_corr']:7.4f}  {r['typed_mean_corr']:7.4f}  "
+              f"{r['kc_corr']:7.4f}  {r['mbon_corr']:7.4f}  "
+              f"{r['ppl_corr']:7.4f}  {r['mean_rate_hz']:7.2f}")
+
+    print()
+    print("=" * 70)
+    print("READOUT TRAINING")
+    print("=" * 70)
+    readout = train_readout_at_best(result)
+    print("Eval accuracy:  " + f"{readout['eval_accuracy']:.4f}")
+    print("Eval loss:      " + f"{readout['eval_loss']:.4f}")
+    print("Train accuracy: " + f"{readout['train_accuracy']:.4f}")
 
 
 if __name__ == "__main__":
