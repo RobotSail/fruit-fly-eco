@@ -1,0 +1,14 @@
+- CRITICAL FIX: Replace the static dashboard with a LIVE monitoring web server. The current dashboard is a static HTML snapshot that shows nothing happening — the user called it trash. Build this INSTEAD:
+- Runs PPO training in a background thread
+- Serves a web dashboard at http://localhost:8080
+- Pushes live updates via Server-Sent Events (SSE) or auto-refresh every 2 seconds
+- Shows REAL training metrics updating in real-time (reward, loss, FCI, step count)
+- Proper wing shape, body segments (head/thorax/abdomen), compound eyes, 6 legs, antennae
+- CSS animations for wing beat (speed keyed to FCI), leg movement, body bob
+- Color: dark brown/amber body, iridescent wings, red compound eyes
+- At least 300px tall, centered, visually impressive
+- FCI over time (line chart, updating live)
+- Mean reward per step (line chart)
+- Policy loss (line chart)
+- Value ratio vs oracle (gauge or bar)
+- The live dashboard server (dashboard_server.py) works but is useless. The user wants THREE specific things added:

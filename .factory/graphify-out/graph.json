@@ -1,0 +1,50 @@
+{
+  "directed": false,
+  "multigraph": false,
+  "graph": {},
+  "nodes": [
+    {
+      "label": "verify-design.sh",
+      "file_type": "code",
+      "source_file": ".factory/hooks/verify-design.sh",
+      "source_location": "L1",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "_origin": "ast",
+      "community": 0,
+      "norm_label": "verify-design.sh",
+      "id": "factory_hooks_verify_design"
+    },
+    {
+      "label": "verify-design.sh script",
+      "file_type": "code",
+      "source_file": ".factory/hooks/verify-design.sh",
+      "source_location": "L1",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "_origin": "ast",
+      "community": 0,
+      "norm_label": "verify-design.sh script",
+      "id": "factory_hooks_verify_design_sh__entry"
+    }
+  ],
+  "links": [
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": ".factory/hooks/verify-design.sh",
+      "source_location": "L1",
+      "weight": 1.0,
+      "_origin": "ast",
+      "confidence_score": 1.0,
+      "source": "factory_hooks_verify_design",
+      "target": "factory_hooks_verify_design_sh__entry"
+    }
+  ],
+  "hyperedges": [],
+  "built_at_commit": "a30a1ec754dd400734e1873d97bcc46c9d4beed6"
+}
