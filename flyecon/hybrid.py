@@ -64,19 +64,13 @@ def _load_connectome_adapted(cache_dir: str = "cache/connectome/") -> Connectome
     ann_df = pf.read_table(str(ann_path)).to_pandas()
 
     # Adapt column names to match ETL builder expectations
-    col_map_w = {"body_pre": "bodyId_pre", "body_post": "bodyId_post"}
-    weights_df = weights_df.rename(
-        columns={k: v for k, v in col_map_w.items() if k in weights_df.columns}
-    )
-
-    col_map_nt = {
-        "body": "bodyId",
-        "predicted_nt": "predictedNt",
+    weights_df = weights_df.rename(columns={
+        "body_pre": "bodyId_pre", "body_post": "bodyId_post",
+    })
+    nt_df = nt_df.rename(columns={
+        "body": "bodyId", "predicted_nt": "predictedNt",
         "consensus_nt": "consensusNt",
-    }
-    nt_df = nt_df.rename(
-        columns={k: v for k, v in col_map_nt.items() if k in nt_df.columns}
-    )
+    })
 
     return load_connectome_from_tables(weights_df, nt_df, ann_df)
 
@@ -326,8 +320,15 @@ def train_and_eval(
     lr: float = 1e-3,
     reservoir_gain: float = 0.05,
     lif_gain: float = 0.5,
+    max_train_samples: int = 2048,
+    max_eval_samples: int = 512,
 ) -> dict[str, float]:
-    """Build hybrid model, train readout on pro data, evaluate. Print accuracy."""
+    """Build hybrid model, train readout on pro data, evaluate. Print accuracy.
+
+    The full-brain rate model + spiking MB simulation is expensive per
+    sample (~0.5s on CPU), so *max_train_samples* and *max_eval_samples*
+    cap the data used.  Set to 0 to use the full dataset.
+    """
 
     # 1. Load full connectome
     log.info("hybrid.loading_connectome")
@@ -346,10 +347,14 @@ def train_and_eval(
         lif_gain=lif_gain,
     )
 
-    # 4. Load data
+    # 4. Load data (cap to max samples for CPU feasibility)
     log.info("hybrid.loading_data")
     train_df = _load_pro_rounds(train_path)
     eval_df = _load_pro_rounds(eval_path)
+    if max_train_samples > 0 and len(train_df) > max_train_samples:
+        train_df = train_df.sample(n=max_train_samples, random_state=42)
+    if max_eval_samples > 0 and len(eval_df) > max_eval_samples:
+        eval_df = eval_df.sample(n=max_eval_samples, random_state=42)
     log.info("hybrid.data_loaded", train=len(train_df), eval=len(eval_df))
 
     # 5. Train readout
@@ -471,6 +476,8 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--reservoir-gain", type=float, default=0.05)
     parser.add_argument("--lif-gain", type=float, default=0.5)
+    parser.add_argument("--max-train", type=int, default=2048)
+    parser.add_argument("--max-eval", type=int, default=512)
     args = parser.parse_args()
 
     train_and_eval(
@@ -482,6 +489,8 @@ def main() -> None:
         lr=args.lr,
         reservoir_gain=args.reservoir_gain,
         lif_gain=args.lif_gain,
+        max_train_samples=args.max_train,
+        max_eval_samples=args.max_eval,
     )
 
 
